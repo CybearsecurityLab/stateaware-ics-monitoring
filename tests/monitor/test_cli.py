@@ -5,10 +5,29 @@ import pandas as pd
 import pytest
 import yaml
 
-pytest.importorskip("rtamt")
+pytest.importorskip("sklearn")
 
 from dataio.manifest import build_dataset_manifest
-from monitor.cli import main
+from monitor.cli import _build_parser, main
+
+
+def test_cli_parser_defaults_to_or():
+    parser = _build_parser()
+    args = parser.parse_args(["--topology", "anytown"])
+    assert args.fusion == "or"
+
+
+def test_cli_parser_ablation_options():
+    parser = _build_parser()
+    assert parser.parse_args(["--topology", "anytown", "--fusion", "or"]).fusion == "or"
+    assert parser.parse_args(["--topology", "anytown", "--fusion", "intersection"]).fusion == "intersection"
+    assert parser.parse_args(["--topology", "anytown", "--fusion", "conjunction"]).fusion == "conjunction"
+
+
+def test_cli_parser_rejects_invalid_fusion():
+    parser = _build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--topology", "anytown", "--fusion", "invalid"])
 
 
 def _seed(data_root: Path):
@@ -29,8 +48,7 @@ def _seed(data_root: Path):
 
 
 def test_ics_monitor_runs_with_fusion_flag_if_data_present(tmp_path):
-    import pytest
-    from pathlib import Path
+    pytest.importorskip("rtamt")
     repo = Path(__file__).resolve().parents[2]
     gfsm = repo / "data" / "generated" / "anytown" / "gfsm" / "anytown.gfsm.json"
     inv = repo / "data" / "generated" / "anytown" / "invariants" / "anytown_phi.json"

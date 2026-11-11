@@ -15,7 +15,7 @@ from .model import MonitorError
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="ics-monitor",
-        description="Hybrid ICS monitor: STL + GFSM + Φ invariants (paper fusion).")
+        description="Hybrid ICS monitor: STL + GFSM + Φ invariants (alarm-union fusion).")
     p.add_argument("--data-root", type=Path, default=Path("data"))
     grp = p.add_mutually_exclusive_group(required=True)
     grp.add_argument("--topology", choices=sorted(PROFILES))
@@ -23,9 +23,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", type=Path, default=None,
                    help="output dir (default: <data-root>/generated/<topo>/monitor)")
     p.add_argument("--jobs", type=int, default=None)
-    p.add_argument("--fusion", choices=["intersection", "or"],
-                   default="intersection",
-                   help="hybrid fusion rule (paper default: intersection)")
+    p.add_argument("--fusion", choices=["or", "intersection", "conjunction"],
+                   default="or",
+                   help="hybrid fusion rule (default: or [alarm union]; "
+                        "intersection/conjunction retains conjunction ablation)")
     p.add_argument("-v", "--verbose", action="store_true")
     return p
 

@@ -139,6 +139,15 @@ def test_if_condition_flattened():
     assert ce.if_statements[0].condition == "T41 < 5"
 
 
+def test_real_literal_condition_flattened():
+    xml = PROGRAM_XML.replace(
+        "<integer-literal>5</integer-literal>",
+        "<real-literal>1.5</real-literal>",
+    )
+    fbd = XmlParser(xml).extract_function_block("PLC1")
+    assert fbd.case_elements[0].if_statements[0].condition == "T41 < 1.5"
+
+
 def test_logical_and_not_flattening():
     xml = """<iec-source><function-block-declaration>
       <derived-function-block-name>FB</derived-function-block-name>

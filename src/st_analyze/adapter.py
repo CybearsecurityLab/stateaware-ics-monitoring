@@ -75,10 +75,29 @@ def analyze_source(source: str) -> AnalyzeResult:
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"pdg export failed: {exc!r}")
 
-    invariants: list[dict] = []
-    for inv_list in (invariant_objs or {}).values():
-        for inv in inv_list:
-            invariants.append(inv.to_dict())
+    case_blocks = list(
+        re.finditer(r"CASE\s+\w+_State\s+OF.*?END_CASE;", source, flags=re.S)
+    )
+    if len(case_blocks) > 1:
+        invariants = []
+        for block in case_blocks:
+            reduced_source = (
+                source[: case_blocks[0].start()]
+                + block.group(0)
+                + source[case_blocks[-1].end() :]
+            )
+            block_result = analyze_source(reduced_source)
+            for invariant in block_result.invariants:
+                tagged = dict(invariant)
+                tagged["case_var"] = block_result.state_variable
+                invariants.append(tagged)
+            errors.extend(block_result.errors)
+    else:
+        invariants = [
+            inv.to_dict()
+            for inv_list in (invariant_objs or {}).values()
+            for inv in inv_list
+        ]
 
     analyzer_noise = captured.getvalue()
     if "Traceback (most recent call last)" in analyzer_noise:

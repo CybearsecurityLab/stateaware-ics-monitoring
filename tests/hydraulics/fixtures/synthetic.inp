@@ -1,0 +1,76 @@
+[TITLE]
+Synthetic hydraulics fixture (metric flow units, LPS)
+
+; Pipe diameters are in millimetres (EPANET metric convention); WNTR
+; converts them to metres.
+
+[JUNCTIONS]
+;ID   Elev   Demand  Pattern
+ J1   100.0  10.0    1
+ J2   105.0  5.0     1
+ J3   102.0  0.0     ""
+
+[DEMANDS]
+;Junction  Demand  Pattern  Category
+ J1  4.0  2  ;irrigation
+ J1  2.0  1  ;domestic
+
+[RESERVOIRS]
+;ID   Head   Pattern
+ R1   50.0   1
+
+[TANKS]
+;ID   Elev   InitLvl MinLvl MaxLvl Diam  MinVol VolCurve Overflow
+ T1   120.0  3.0     0.0    10.0   12.0   0.0    VC1    0
+
+[PIPES]
+;ID  Node1 Node2 Length Diameter Roughness MinorLoss
+ P1  J1    J2    500.0  300     100      0.5
+ P2  J2    J3    400.0  250     120      0.0
+ P3  J3    R1    600.0  350     90       0.2
+
+[PUMPS]
+;ID  Node1 Node2 Params
+ PU1 R1    J1    HEAD PU1HEAD
+ PU2 J1    J2    POWER 50.0
+ PU3 J2    J3    HEAD PU1HEAD SPEED 1.5
+
+[VALVES]
+;ID  Node1 Node2 Diameter Type Setting MinorLoss
+ V1  J2    J3    200     PRV   45.0    0.0
+ V2  J3    J1    200     PSV   30.0    0.0
+ V3  J1    J2    200     PBV   15.0    0.0
+ V4  J1    J2    200     FCV   1.0     0.0
+ V5  J1    J2    200     TCV   0.5     0.0
+ V6  J1    J2    200     GPV   GPVHL
+
+[CURVES]
+;ID        X-Value  Y-Value
+ PU1HEAD   0.0      80.0
+ PU1HEAD   100.0    60.0
+ PU1HEAD   200.0    40.0
+ VC1       0.0      0.0
+ VC1       5.0      900.0
+ VC1       10.0     1900.0
+ GPVHL     0.0      0.0
+ GPVHL     10.0     5.0
+
+[PATTERNS]
+;ID   Multipliers
+ 1    1.0  1.2  0.8
+ 2    0.5  0.6  0.7
+
+[EMITTERS]
+;Junction  Coeff
+ J3         0.002
+
+[CONTROLS]
+LINK PU1 OPEN IF NODE J1 ABOVE 50.0
+
+[OPTIONS]
+ Units        LPS
+ Headloss     H-W
+
+[TIMES]
+ Duration     24:00
+ HYDRAULIC Timestep 0.5

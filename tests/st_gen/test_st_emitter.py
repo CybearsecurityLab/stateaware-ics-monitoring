@@ -19,7 +19,7 @@ def _net_minitown_like() -> Network:
     """One tank, one pump, two controls — minitown PUMP1/TANK pattern."""
     return Network(
         tanks=[Tank(id="TANK", min_level=0.0, max_level=6.5)],
-        pumps=[Pump(id="PUMP1", node1="J1", node2="TANK")],
+        pumps=[Pump(id="PUMP1", node1="J1", node2="TANK", initial_status="CLOSED")],
         valves=[],
         controls=[
             Control(
@@ -58,8 +58,9 @@ def test_emit_single_actuator(tmp_path):
     assert "PUMP1_State := 1;" in text
     assert "IF TANK > 6.3 THEN" in text
     assert "PUMP1_State := 0;" in text
-    # Output assignment
-    assert "PUMP1 := (PUMP1_State = 1);" in text
+    # Output assignments
+    assert "PUMP1 := FALSE;" in text
+    assert "PUMP1 := TRUE;" in text
     # Manifest
     assert manifest.topology == "mini"
     assert manifest.plcs[0]["actuators"] == ["PUMP1"]
@@ -189,6 +190,33 @@ def test_manifest_contains_provenance_and_fsm_summary(tmp_path):
     assert plc0["actuators"] == ["PUMP1"]
     assert plc0["fsms"] == [{"actuator": "PUMP1", "states": 2, "transitions": 2}]
     assert plc0["sensors_referenced"] == [{"id": "TANK", "owner_plc": "PLC1"}]
+
+
+def test_provenance_records_surrogate_inputs_and_initial_state(tmp_path):
+    inp = tmp_path / "mini.inp"
+    plcs_path = tmp_path / "mini_plcs.yaml"
+    inp.write_text("[END]\n", encoding="utf-8")
+    plcs_path.write_text("- name: PLC1\n  sensors: [TANK]\n  actuators: [PUMP1]\n", encoding="utf-8")
+    manifest = emit(
+        _net_minitown_like(),
+        [Plc(name="PLC1", sensors=["TANK"], actuators=["PUMP1"])],
+        out_dir=tmp_path,
+        topology="mini",
+        inp_path=inp,
+        plcs_path=plcs_path,
+    )
+    import hashlib
+    import json
+    provenance = json.loads((tmp_path / "mini_manifest.json").read_text())["provenance"]
+    assert provenance["surrogate"] is True
+    assert provenance["upstream"]["commit"] == "51a5e00f65cdd666b9aec10d3c928ea40ad1b53d"
+    assert provenance["inputs"]["inp"]["sha256"] == hashlib.sha256(inp.read_bytes()).hexdigest()
+    assert provenance["inputs"]["plcs_yaml"]["sha256"] == hashlib.sha256(plcs_path.read_bytes()).hexdigest()
+    assert provenance["actuator_initial_states"]["PUMP1"] == "CLOSED"
+    text = (tmp_path / "mini_plc1.st").read_text(encoding="utf-8")
+    assert "SURROGATE Structured Text" in text
+    assert "NOT the original vendor or benchmark" in text
+    assert "PUMP1_State : INT := 0;" in text
 
 
 def test_threshold_formatting_is_clean(tmp_path):

@@ -49,7 +49,10 @@ plus `<topology>_analysis_manifest.json` (provenance + per-PLC status,
 cross-checked against `st_gen`'s FSM counts).
 
 The vendored analyzer is never modified; any dialect mismatch is fixed in
-`st_gen`'s emitter or `st_analyze/adapter.py`.
+`st_gen`'s emitter or `st_analyze/adapter.py`. The emitter places actuation
+assignments inside their CASE branches. For multi-actuator PLCs, the adapter
+analyzes each CASE block separately, tags invariants with their selector, and
+aggregates them; regression tests cover every actuator block.
 
 ## Stage 3 — STL monitor (`stl-monitor`) + hybrid (`ics-monitor`)
 
@@ -91,5 +94,65 @@ resolved automatically per-actuator from the CASE selector
 (`ACT` → `S_`+`ACT` → lowercase fallback) — no manual configuration. The runtime
 monitor (`ics-monitor`) consumes `Φ` and the GFSM JSON, loaded once at
 `fit()` (build-once / reuse-many; staleness-gated by sha256). Fusion
-defaults to the paper's intersection rule `(gfsm OR invariants) AND stl`;
-pass `--fusion or` for the baseline.
+defaults to the paper's alarm-union rule `(gfsm OR invariants) OR stl`
+(safe behavior is LogicValid AND PhysicsValid, so an alarm is any logical
+OR physical violation); pass `--fusion intersection` for the conjunction ablation.
+
+## Expanded full-signal evaluation
+
+The `scripts/run_full_signal_*.py` entry points evaluate the six baselines on
+Anytown, C-Town and L-Town. `scripts/export_logic_attack_predictions.py`
+exports GFSM, global-Phi, STL and their three-way alarm union, and
+`scripts/sweep_logic_tolerances.py` runs the nine-configuration tolerance
+sweep with one Phi mining run per topology. All primary metrics use
+injection-window labels; observation-aware outputs remain separate.
+
+```bash
+uv run --no-sync python scripts/export_logic_attack_predictions.py
+uv run --no-sync python scripts/sweep_logic_tolerances.py
+for topology in anytown ctown ltown; do
+  uv run --no-sync python scripts/run_full_signal_cusum.py --topology "$topology"
+  uv run --no-sync python scripts/run_full_signal_sain.py --topology "$topology"
+  uv run --no-sync python scripts/run_full_signal_sain_local.py --topology "$topology"
+  uv run --no-sync python scripts/run_full_signal_sicams.py --topology "$topology"
+  uv run --no-sync python scripts/run_full_signal_hybrid.py --topology "$topology"
+  uv run --no-sync python scripts/run_full_signal_conv.py --topology "$topology" --device cpu
+done
+uv run --no-sync python scripts/analyze_imdisco_tractability.py
+uv run --no-sync python scripts/build_expansion_pack.py
+uv run --no-sync python scripts/render_expansion_results.py
+```
+
+Global Phi uses the nominal 64% training rows for NiaARM mining and the 16%
+clean validation rows for its violation threshold. Its feature policy excludes
+state columns, labels, timestamps and simulator-truth channels. The fused flag
+is `GFSM OR Phi OR STL`; all four per-row outputs are preserved. Local SAIN
+accepts `--jobs N` for process-parallel component mining with identical data
+and per-component seeds.
+
+Use `--reuse-model` with `run_full_signal_conv.py` or
+`run_full_signal_hybrid.py` to re-score a saved model without retraining. Conv
+recomputes the validation threshold with the same float64 residual arithmetic
+used at evaluation. Hybrid prepends the final `min_scored` rows of the 64%
+nominal training partition to every evaluation run, scores every evaluation
+row, and preserves the existing validation predictions and independent episode
+manifest provenance. On the ROCm host, set `STATEAWARE_REPO_ROOT` to the
+checkout and use `--device cuda` for ConvBiLSTM training.
+
+The IM-DISCO command is analysis-only: it records exact exponential output
+bounds without materializing uncapped itemsets. Existing unavailable results
+stay unscored. SICAMS writes INP-backed Laplacian fields and compressed per-row
+discrimination diagnostics under `scripts/out/full_signal_sicams/<topology>/`.
+SAIN keeps official QuantMiner rules separate from its empirical passive
+detector. SMONITOR is not available in the official artifact and is not
+claimed as reproduced.
+
+After the final source and paper commits, create the read-only evidence archive
+outside the checkout. The manifest records both commit hashes and a SHA-256 for
+every selected raw or generated file.
+
+```bash
+uv run --no-sync python scripts/create_reproducibility_snapshot.py \
+  --output ../dimva2027-reproducibility.tar
+(cd .. && shasum -a 256 -c dimva2027-reproducibility.sha256)
+```

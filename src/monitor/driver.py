@@ -1,8 +1,9 @@
 """Hybrid driver: STL physics + GFSM δ + Φ invariants per scenario, fuse.
 
 Detectors load pre-built artifacts (gfsm json, Φ json) at fit() — nothing
-is re-mined/re-extracted at predict time. Default fusion is the paper's
-intersection rule: (gfsm OR invariants) AND stl; --fusion or = baseline.
+is re-mined/re-extracted at predict time. Safe behavior is LogicValid AND
+PhysicsValid; default fusion is the alarm-union rule (gfsm OR invariants OR stl).
+Conjunction mode ((gfsm OR invariants) AND stl) is retained as an ablation option.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from invariants.state_label import resolve_fb_to_col_from_paths
 from stl.metrics import detection_metrics
 from stl.profiles import get_profile
 
-from .fusion import fuse_intersection, fuse_or
+from .fusion import compute_fused_score, fuse_intersection, fuse_or
 from .gfsm_detector import GfsmAnomalyDetector
 from .invariants_detector import InvariantsAnomalyDetector
 from .model import MonitorError
@@ -28,7 +29,7 @@ from .stl_detector import StlAnomalyDetector
 
 
 def run_topology(*, topology: str, data_root: Path, out_dir: Path | None,
-                  fusion: str = "intersection",
+                  fusion: str = "or",
                   jobs: int | None = None) -> dict[str, Any]:
     profile = get_profile(topology)
     try:
@@ -61,20 +62,18 @@ def run_topology(*, topology: str, data_root: Path, out_dir: Path | None,
         s = stl_det.predict(sc.frame)
         g = gfsm_det.predict(sc.frame)
         v = inv_det.predict(sc.frame)
-        if fusion == "intersection":
+        if fusion in ("intersection", "conjunction"):
             fused = fuse_intersection([g.flags, v.flags], [s.flags])
-        else:
+        elif fusion == "or":
             fused = fuse_or([s.flags, g.flags, v.flags])
+        else:
+            raise MonitorError(f"unknown fusion rule: {fusion}")
+        scores = compute_fused_score(fused, s.scores)
         y = sc.labels.astype(int)
         scen.append({
             "name": sc.name, "n": int(len(y)),
             "attack_rows": int(y.sum()),
-            # STL is the only detector with a continuous score; use it as
-            # the threshold-free ranking signal even when the fused
-            # decision came from gfsm/invariants.
-            "metrics": detection_metrics(
-                y, fused,
-                s.scores if s.scores is not None else fused.astype(float)),
+            "metrics": detection_metrics(y, fused, scores),
         })
         for i in range(len(y)):
             rows.append({"scenario": sc.name, "row": i,
@@ -82,7 +81,8 @@ def run_topology(*, topology: str, data_root: Path, out_dir: Path | None,
                          "y_pred_stl": int(s.flags[i]),
                          "y_pred_gfsm": int(g.flags[i]),
                          "y_pred_invariants": int(v.flags[i]),
-                         "y_pred": int(fused[i])})
+                         "y_pred": int(fused[i]),
+                         "anomaly_score": float(scores[i])})
 
     pd.DataFrame(rows).to_csv(out / "predictions.csv", index=False)
     # all_ok is structurally always True here: the three detectors load

@@ -16,6 +16,47 @@ END_CASE;
 END_PROGRAM
 """
 
+MULTI_ACTUATOR_ST = """\
+PROGRAM PLC1
+VAR_INPUT
+    T1 : REAL;
+    T2 : REAL;
+END_VAR
+VAR_OUTPUT
+    P1 : BOOL;
+    P2 : BOOL;
+END_VAR
+VAR
+    P1_State : INT := 1;
+    P2_State : INT := 1;
+END_VAR
+CASE P1_State OF
+    0:
+        P1 := FALSE;
+        IF T1 < 5 THEN
+            P1_State := 1;
+        END_IF;
+    1:
+        P1 := TRUE;
+        IF T1 > 8 THEN
+            P1_State := 0;
+        END_IF;
+END_CASE;
+CASE P2_State OF
+    0:
+        P2 := FALSE;
+        IF T2 < 5 THEN
+            P2_State := 1;
+        END_IF;
+    1:
+        P2 := TRUE;
+        IF T2 > 8 THEN
+            P2_State := 0;
+        END_IF;
+END_CASE;
+END_PROGRAM
+"""
+
 EMPTY_ST = "PROGRAM PLC2\n(* no actuators *)\nEND_PROGRAM\n"
 
 
@@ -32,6 +73,15 @@ def test_analyze_source_produces_pdg_and_invariant_containers():
     assert "digraph" in r.pdg_dot.lower() or r.pdg_dot == ""
     assert r.ok is True
     assert r.programs  # PDG state keys present (e.g. ["0"])
+
+
+def test_multi_actuator_analysis_aggregates_every_case_block():
+    r = analyze_source(MULTI_ACTUATOR_ST)
+    assert r.ok is True, r.errors
+    actuation = [inv for inv in r.invariants if inv.get("actuation_var")]
+    assert {inv["actuation_var"] for inv in actuation} == {"P1", "P2"}
+    assert {inv["case_var"] for inv in actuation} == {"P1_State", "P2_State"}
+    assert len(actuation) == 4
 
 
 def test_analyze_empty_program_is_ok_not_crash():

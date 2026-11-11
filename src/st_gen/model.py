@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
@@ -17,6 +17,7 @@ class Pump:
     id: str
     node1: str
     node2: str
+    initial_status: str = "OPEN"
 
 
 @dataclass(frozen=True)
@@ -26,6 +27,7 @@ class Valve:
     node2: str
     vtype: str
     setting: float
+    initial_status: str = "OPEN"
 
 
 @dataclass(frozen=True)
@@ -84,3 +86,5 @@ class Manifest:
     plcs_yaml: str
     generated_at: str
     plcs: list[dict]
+    #: Surrogate provenance block (see :mod:`st_gen.provenance`).
+    provenance: dict = field(default_factory=dict)

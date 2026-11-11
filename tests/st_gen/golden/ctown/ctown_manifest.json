@@ -2,7 +2,7 @@
   "topology": "ctown",
   "inp": "ctown.inp",
   "plcs_yaml": "ctown_plcs.yaml",
-  "generated_at": "2026-05-17T01:01:36+00:00",
+  "generated_at": "2026-11-10T21:59:31+00:00",
   "plcs": [
     {
       "name": "PLC1",
@@ -160,5 +160,47 @@
       "sensors_referenced": [],
       "fsms": []
     }
-  ]
+  ],
+  "provenance": {
+    "surrogate": true,
+    "statement": "SURROGATE Structured Text: reconstructed by st_gen from the EPANET INP model and a DHALSIM-style plcs.yaml. This is NOT the original vendor or benchmark PLC source code and must not be presented as such.",
+    "generator": {
+      "name": "st_gen",
+      "version": "0.1.0"
+    },
+    "upstream": {
+      "project": "DHALSIM",
+      "url": "https://github.com/Critical-Infrastructure-Systems-Lab/DHALSIM",
+      "commit": "51a5e00f65cdd666b9aec10d3c928ea40ad1b53d"
+    },
+    "inputs": {
+      "inp": {
+        "path": "ctown.inp",
+        "sha256": null
+      },
+      "plcs_yaml": {
+        "path": "ctown_plcs.yaml",
+        "sha256": null
+      }
+    },
+    "actuator_initial_states": {
+      "PU1": "CLOSED",
+      "PU10": "CLOSED",
+      "PU11": "CLOSED",
+      "PU2": "OPEN",
+      "PU4": "CLOSED",
+      "PU5": "CLOSED",
+      "PU6": "CLOSED",
+      "PU7": "CLOSED",
+      "PU8": "CLOSED",
+      "V2": "CLOSED"
+    },
+    "control_limitations": [
+      "supported: simple node controls only: LINK <id> OPEN|CLOSED IF NODE <id> BELOW|ABOVE <threshold>",
+      "unsupported: [RULES] sections (st_gen raises UnsupportedRulesError)",
+      "unsupported: time-based controls (e.g. 'AT TIME <h>:<m>')",
+      "unsupported: numeric / setpoint controls (e.g. 'SET <id> TO <value>')",
+      "unsupported: controls whose (comparator, threshold) pair is ambiguous between OPEN and CLOSED"
+    ]
+  }
 }

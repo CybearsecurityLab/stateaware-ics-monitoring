@@ -15,6 +15,8 @@ dependencies = [
     "py7zr>=0.21",
     "zarr>=2.17",
     "niaarm>=0.3.10",
+    "wntr>=1.3",
+    "six>=1.17.0",
 ]
 
 [project.optional-dependencies]
@@ -25,6 +27,7 @@ baselines = [
     "torch",
     "xgboost",
     "imbalanced-learn",
+    "mlxtend>=0.25.0",
 ]
 
 [project.scripts]
@@ -49,4 +52,4 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/st_gen", "src/iec_st_compiler", "src/st_analyze", "src/gfsm", "src/dataio", "src/stl", "src/monitor", "src/invariants", "baselines"]
+packages = ["src/st_gen", "src/iec_st_compiler", "src/st_analyze", "src/gfsm", "src/dataio", "src/stl", "src/monitor", "src/invariants", "src/hydraulics", "src/simulation", "baselines"]

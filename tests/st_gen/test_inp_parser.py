@@ -117,3 +117,61 @@ def test_parse_control_trailing_dot_threshold(tmp_path):
     net = parse_inp(inp)
     assert len(net.controls) == 1
     assert net.controls[0].threshold == 100.0
+
+
+def test_parse_status_open_and_closed(tmp_path):
+    inp = tmp_path / "status.inp"
+    inp.write_text(
+        "[PUMPS]\nPU1 J1 T1 HEAD 1\nPU2 J1 T1 HEAD 1\n"
+        "[VALVES]\nV1 J1 T1 100 PRV 40\n"
+        "[STATUS]\nPU1 Closed\nPU2 Open\nV1 Closed\n[END]\n",
+        encoding="utf-8",
+    )
+    net = parse_inp(inp)
+    assert net.pumps[0].initial_status == "CLOSED"
+    assert net.pumps[1].initial_status == "OPEN"
+    assert net.valves[0].initial_status == "CLOSED"
+
+
+def test_parse_status_defaults_to_open(tmp_path):
+    inp = tmp_path / "default_status.inp"
+    inp.write_text(
+        "[PUMPS]\nPU1 J1 T1 HEAD 1\n[STATUS]\n[END]\n",
+        encoding="utf-8",
+    )
+    net = parse_inp(inp)
+    assert net.pumps[0].initial_status == "OPEN"
+
+
+def test_parse_status_numeric_setting(tmp_path):
+    inp = tmp_path / "numeric_status.inp"
+    inp.write_text(
+        "[PUMPS]\nPU1 J1 T1 HEAD 1\nPU2 J1 T1 HEAD 1\n"
+        "[STATUS]\nPU1 0.0\nPU2 1.2\n[END]\n",
+        encoding="utf-8",
+    )
+    net = parse_inp(inp)
+    assert net.pumps[0].initial_status == "CLOSED"
+    assert net.pumps[1].initial_status == "OPEN"
+
+
+def test_parse_status_malformed_line_raises(tmp_path):
+    from st_gen.model import MalformedInpError
+    inp = tmp_path / "bad_status.inp"
+    inp.write_text(
+        "[PUMPS]\nPU1 J1 T1 HEAD 1\n[STATUS]\nPU1\n[END]\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(MalformedInpError):
+        parse_inp(inp)
+
+
+def test_parse_status_invalid_value_raises(tmp_path):
+    from st_gen.model import MalformedInpError
+    inp = tmp_path / "invalid_status.inp"
+    inp.write_text(
+        "[PUMPS]\nPU1 J1 T1 HEAD 1\n[STATUS]\nPU1 BADSTATUS\n[END]\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(MalformedInpError):
+        parse_inp(inp)

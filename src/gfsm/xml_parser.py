@@ -226,7 +226,7 @@ class XmlParser:
                         parts.append("NOT ")
                         in_not = False
                     parts.append(n.text)
-            elif tag in ("integer-literal", "boolean-literal"):
+            elif tag in ("integer-literal", "real-literal", "boolean-literal"):
                 if n.text is not None:
                     parts.append(n.text)
         return "".join(parts).strip()
@@ -246,7 +246,7 @@ class XmlParser:
                 variable = n.text
                 break
         for n in assign_node.iter():
-            if n.tag in ("integer-literal", "boolean-literal") and n.text is not None:
+            if n.tag in ("integer-literal", "real-literal", "boolean-literal") and n.text is not None:
                 value = n.text
                 break
         return Assignment(variable=variable, value=value)

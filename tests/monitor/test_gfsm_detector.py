@@ -35,7 +35,7 @@ def test_clean_trace_no_flags(tmp_path: Path):
         fb_to_col={("PLC1", "S"): "p1"},
     ).fit([])
     # states: 0(stutter)->0->1(legal t0)->0(legal t1): no flags
-    frame = pd.DataFrame({"p1": [0, 0, 1, 0]})
+    frame = pd.DataFrame({"p1": [0, 0, 1, 0], "l_t1": [9, 9, 1, 4]})
     out = det.predict(frame)
     assert (out.flags == np.zeros(4, dtype=int)).all()
 
@@ -47,7 +47,7 @@ def test_unknown_state_flagged(tmp_path: Path):
         fb_to_col={("PLC1", "S"): "p1"},
     ).fit([])
     # p1=2 -> "PLC1.S:2" not in states -> flag at row 2
-    out = det.predict(pd.DataFrame({"p1": [0, 1, 2, 0]}))
+    out = det.predict(pd.DataFrame({"p1": [0, 1, 2, 0], "l_t1": [9, 1, 9, 9]}))
     assert out.flags[2] == 1
 
 
@@ -170,3 +170,128 @@ def test_transition_missing_keys_raises_monitor_error(tmp_path: Path):
         fb_to_col={("PLC1", "S"): "p1"})
     with pytest.raises(MonitorError, match="missing from/to keys"):
         det.fit([])
+
+
+def test_guard_mismatch_flags_pair_only_transition(tmp_path: Path):
+    gfsm_dir = _write_gfsm(tmp_path)
+    det = GfsmAnomalyDetector(
+        gfsm_dir=gfsm_dir, topology="synth",
+        fb_to_col={("PLC1", "S"): "p1", ("PLC1", "T1"): "l_t1"},
+    ).fit([])
+    out = det.predict(pd.DataFrame({"p1": [0, 1], "l_t1": [9.0, 3.0]}))
+    assert out.flags.tolist() == [0, 1]
+    assert out.scores.tolist() == [0.0, 1.0]
+
+
+def test_guard_satisfied_and_stutter_pass(tmp_path: Path):
+    gfsm_dir = _write_gfsm(tmp_path)
+    det = GfsmAnomalyDetector(
+        gfsm_dir=gfsm_dir, topology="synth",
+        fb_to_col={("PLC1", "S"): "p1", ("PLC1", "T1"): "l_t1"},
+    ).fit([])
+    out = det.predict(pd.DataFrame({"p1": [0, 0, 1], "l_t1": [99.0, 1.0, 1.0]}))
+    assert out.flags.tolist() == [0, 0, 0]
+
+
+def test_compose_global_guard_key_and_boolean_literals(tmp_path: Path):
+    gfsm_dir = _write_gfsm(tmp_path)
+    path = gfsm_dir / "synth.gfsm.json"
+    data = json.loads(path.read_text())
+    data["transitions"][0]["guard"] = "TRUE"
+    data["transitions"][0]["condition"] = "T1 < 0"
+    path.write_text(json.dumps(data))
+    det = GfsmAnomalyDetector(gfsm_dir=gfsm_dir, topology="synth", fb_to_col={("PLC1", "S"): "p1"}).fit([])
+    assert det.predict(pd.DataFrame({"p1": [0, 1]})).flags.tolist() == [0, 0]
+
+
+@pytest.mark.parametrize(("op", "value", "flag"), [
+    ("=", 1, 0), ("=", 0, 1), ("<>", 0, 0), ("<>", 1, 1),
+    ("<", 0, 0), ("<", 2, 1), ("<=", 1, 0), ("<=", 2, 1),
+    (">", 2, 0), (">", 0, 1), (">=", 1, 0), (">=", 0, 1),
+])
+def test_guard_comparators(tmp_path, op, value, flag):
+    gfsm_dir = _write_gfsm(tmp_path)
+    path = gfsm_dir / "synth.gfsm.json"
+    data = json.loads(path.read_text())
+    data["transitions"][0]["guard"] = f"T1 {op} 1"
+    path.write_text(json.dumps(data))
+    det = GfsmAnomalyDetector(gfsm_dir=gfsm_dir, topology="synth", fb_to_col={("PLC1", "S"): "p1", ("PLC1", "T1"): "l_t1"}).fit([])
+    assert det.predict(pd.DataFrame({"p1": [0, 1], "l_t1": [99, value]})).flags.tolist() == [0, flag]
+
+
+def test_dnf_boolean_actuals_and_predict_resets(tmp_path):
+    gfsm_dir = _write_gfsm(tmp_path)
+    path = gfsm_dir / "synth.gfsm.json"
+    data = json.loads(path.read_text())
+    data["transitions"][0]["guard"] = "T1 = TRUE OR T1 = false"
+    path.write_text(json.dumps(data))
+    det = GfsmAnomalyDetector(gfsm_dir=gfsm_dir, topology="synth", fb_to_col={("PLC1", "S"): "p1", ("PLC1", "T1"): "l_t1"}).fit([])
+    for value in (True, np.bool_(False), 1, 0):
+        assert det.predict(pd.DataFrame({"p1": [0, 1], "l_t1": [0, value]})).flags.tolist() == [0, 0]
+    assert det.predict(pd.DataFrame({"p1": [0]})).flags.tolist() == [0]
+
+
+def _guard_detector(tmp_path, guard, fb_to_col=None):
+    gfsm_dir = _write_gfsm(tmp_path)
+    path = gfsm_dir / "synth.gfsm.json"
+    data = json.loads(path.read_text())
+    data["transitions"][0]["guard"] = guard
+    path.write_text(json.dumps(data))
+    return GfsmAnomalyDetector(
+        gfsm_dir=gfsm_dir, topology="synth",
+        fb_to_col=fb_to_col or {("PLC1", "S"): "p1", ("PLC1", "T1"): "l_t1"},
+    ).fit([])
+
+
+def test_dnf_alternative_satisfied(tmp_path):
+    det = _guard_detector(tmp_path, "T1 < 0 OR T1 >= 5")
+    assert det.predict(pd.DataFrame({"p1": [0, 1], "l_t1": [2, 6]})).flags.tolist() == [0, 0]
+
+
+def test_boolean_false_literal_and_reject_nonbinary_actual(tmp_path):
+    from monitor.model import MonitorError
+    det = _guard_detector(tmp_path, "T1 = FALSE")
+    assert det.predict(pd.DataFrame({"p1": [0, 1], "l_t1": [0, 0]})).flags.tolist() == [0, 0]
+    with pytest.raises(MonitorError):
+        det.predict(pd.DataFrame({"p1": [0, 1], "l_t1": [0, 2]}))
+
+
+@pytest.mark.parametrize("bad", ["T1 < 2 OR garbage", "T1 < 2 junk", "T1 <"])
+def test_malformed_guard_rejected_at_fit(tmp_path, bad):
+    from monitor.model import MonitorError
+    gfsm_dir = _write_gfsm(tmp_path)
+    path = gfsm_dir / "synth.gfsm.json"
+    data = json.loads(path.read_text())
+    data["transitions"][0]["guard"] = bad
+    path.write_text(json.dumps(data))
+    with pytest.raises(MonitorError, match="malformed GFSM guard"):
+        GfsmAnomalyDetector(gfsm_dir=gfsm_dir, topology="synth", fb_to_col={("PLC1", "S"): "p1"}).fit([])
+
+
+def test_missing_and_nonfinite_guard_input_raise(tmp_path):
+    from monitor.model import MonitorError
+    det = _guard_detector(tmp_path, "T1 < 2")
+    with pytest.raises(MonitorError, match="missing guard sensor"):
+        det.predict(pd.DataFrame({"p1": [0, 1]}))
+    with pytest.raises(MonitorError, match="nonfinite"):
+        det.predict(pd.DataFrame({"p1": [0, 1], "l_t1": [0, np.inf]}))
+
+
+def test_ambiguous_guard_sensor_mapping_raises(tmp_path):
+    from monitor.model import MonitorError
+    det = _guard_detector(tmp_path, "T1 < 2")
+    with pytest.raises(MonitorError, match="ambiguous guard sensor"):
+        det.predict(pd.DataFrame({"p1": [0, 1], "T1": [0, 1], "l_t1": [0, 1]}))
+
+
+def test_guard_mapping_j280_and_true_literal(tmp_path):
+    det = _guard_detector(tmp_path, "J280 = true", {("PLC1", "S"): "p1"})
+    assert det.predict(pd.DataFrame({"p1": [0, 1], "p_j280": [0, 1]})).flags.tolist() == [0, 0]
+
+
+def test_scenario_predict_calls_reset_transition_history(tmp_path):
+    det = _guard_detector(tmp_path, "T1 < 2")
+    # The second trace begins in state 1; its first row must not be checked as
+    # a continuation of the prior scenario's final state 1.
+    assert det.predict(pd.DataFrame({"p1": [0, 1], "l_t1": [1, 1]})).flags.tolist() == [0, 0]
+    assert det.predict(pd.DataFrame({"p1": [1], "l_t1": [99]})).flags.tolist() == [0]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 from pathlib import Path
 
 from .model import (
@@ -56,6 +57,7 @@ def parse_inp(path: str | Path) -> Network:
     pumps: list[Pump] = []
     valves: list[Valve] = []
     controls: list[Control] = []
+    statuses: dict[str, str] = {}
 
     for section, lineno, _raw, data in _iter_section_lines(text):
         if section == "TANKS":
@@ -66,11 +68,24 @@ def parse_inp(path: str | Path) -> Network:
             valves.append(_parse_valve(data, lineno))
         elif section == "CONTROLS":
             controls.append(_parse_control(data, lineno))
+        elif section == "STATUS":
+            link_id, status = _parse_status(data, lineno)
+            statuses[link_id.upper()] = status
         elif section == "RULES":
             raise UnsupportedRulesError(
                 f"[RULES] section is non-empty at line {lineno}: {data!r}. "
                 "st_gen does not support [RULES] yet."
             )
+
+    if statuses:
+        pumps = [
+            replace(p, initial_status=_lookup_status(statuses, p.id, p.initial_status))
+            for p in pumps
+        ]
+        valves = [
+            replace(v, initial_status=_lookup_status(statuses, v.id, v.initial_status))
+            for v in valves
+        ]
 
     return Network(tanks=tanks, pumps=pumps, valves=valves, controls=controls)
 
@@ -131,3 +146,47 @@ def _parse_control(data: str, lineno: int) -> Control:
         comparator=comparator.upper(),
         threshold=float(threshold),
     )
+
+
+def _parse_status(data: str, lineno: int) -> tuple[str, str]:
+    """Parse one ``[STATUS]`` line into ``(link_id, "OPEN"|"CLOSED")``.
+
+    EPANET writes ``<id> <status>`` where the status is ``OPEN``/``CLOSED``
+    for pumps and valves, or a numeric setting for some valve types.  A
+    numeric ``0`` means closed, anything else means open.
+    """
+    parts = data.split()
+    if len(parts) < 2:
+        raise MalformedInpError(
+            f"[STATUS] line {lineno} has too few fields: {data!r}"
+        )
+    link_id, raw_status = parts[0], parts[1]
+    value = raw_status.upper()
+    if value in ("OPEN", "ACTIVE"):
+        return link_id, "OPEN"
+    if value == "CLOSED":
+        return link_id, "CLOSED"
+    try:
+        number = float(raw_status)
+    except ValueError:
+        raise MalformedInpError(
+            f"[STATUS] line {lineno} has an invalid status: {raw_status!r}"
+        ) from None
+    return link_id, "CLOSED" if number == 0.0 else "OPEN"
+
+
+def _lookup_status(
+    statuses: dict[str, str], link_id: str, default: str = "OPEN"
+) -> str:
+    """Return the initial status of *link_id* (case-insensitive).
+
+    Falls back to *default* (the EPANET default, ``OPEN``) when the link has
+    no ``[STATUS]`` entry.
+    """
+    if link_id in statuses:
+        return statuses[link_id]
+    upper = link_id.upper()
+    for key, value in statuses.items():
+        if key.upper() == upper:
+            return value
+    return default

@@ -7,6 +7,23 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .model import (
+    Control,
+    Manifest,
+    MultiStateActuatorError,
+    Network,
+    Plc,
+)
+from .provenance import (
+    CONTROL_LIMITATIONS,
+    GENERATOR_NAME,
+    GENERATOR_VERSION,
+    SURROGATE_HEADER_LINES,
+    SURROGATE_STATEMENT,
+    sha256_file,
+    upstream_block,
+)
+
 
 def _iec_ident(name: str) -> str:
     """Return a valid IEC 61131-3 identifier for *name*.
@@ -17,14 +34,6 @@ def _iec_ident(name: str) -> str:
     """
     return f"v_{name}" if name and name[0].isdigit() else name
 
-from .model import (
-    Control,
-    Manifest,
-    MultiStateActuatorError,
-    Network,
-    Plc,
-)
-
 
 def emit(
     network: Network,
@@ -34,8 +43,15 @@ def emit(
     write_manifest: bool = True,
     inp_filename: str = "",
     plcs_filename: str = "",
+    inp_path: str | Path | None = None,
+    plcs_path: str | Path | None = None,
 ) -> Manifest:
     """Emit one .st file per PLC and (optionally) a manifest.
+
+    ``inp_path`` / ``plcs_path`` are the *full paths* of the source files.  When
+    given, the manifest records them together with their SHA256 digests.  When
+    omitted (older programmatic callers) the manifest falls back to the bare
+    filenames and records a null digest, so existing usage keeps working.
 
     Returns the Manifest dataclass.
     """
@@ -44,12 +60,20 @@ def emit(
 
     sensor_owner = _build_sensor_owner_index(plcs)
     controls_by_link = _index_controls_by_link(network.controls)
+    initial_states = _initial_state_index(network)
+    actuator_states = _resolve_actuator_states(plcs, initial_states)
 
     plc_entries: list[dict] = []
     for plc in plcs:
         file_name = f"{topology}_{plc.name.lower()}.st"
         content, fsms, sensors_referenced = _render_plc(
-            plc, controls_by_link, sensor_owner, topology, inp_filename, plcs_filename
+            plc,
+            controls_by_link,
+            sensor_owner,
+            topology,
+            inp_filename,
+            plcs_filename,
+            actuator_states,
         )
         (out / file_name).write_text(content, encoding="utf-8")
         plc_entries.append(
@@ -68,6 +92,13 @@ def emit(
         plcs_yaml=plcs_filename,
         generated_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         plcs=plc_entries,
+        provenance=_build_provenance(
+            inp_filename=inp_filename,
+            plcs_filename=plcs_filename,
+            inp_path=inp_path,
+            plcs_path=plcs_path,
+            actuator_states=actuator_states,
+        ),
     )
     if write_manifest:
         (out / f"{topology}_manifest.json").write_text(
@@ -77,6 +108,64 @@ def emit(
     return manifest
 
 
+def _build_provenance(
+    *,
+    inp_filename: str,
+    plcs_filename: str,
+    inp_path: str | Path | None,
+    plcs_path: str | Path | None,
+    actuator_states: dict[str, str],
+) -> dict:
+    """Build the surrogate-provenance block recorded in the manifest."""
+    return {
+        "surrogate": True,
+        "statement": SURROGATE_STATEMENT,
+        "generator": {"name": GENERATOR_NAME, "version": GENERATOR_VERSION},
+        "upstream": upstream_block(),
+        "inputs": {
+            "inp": _input_entry(inp_filename, inp_path),
+            "plcs_yaml": _input_entry(plcs_filename, plcs_path),
+        },
+        "actuator_initial_states": dict(sorted(actuator_states.items())),
+        "control_limitations": list(CONTROL_LIMITATIONS),
+    }
+
+
+def _input_entry(filename: str, path: str | Path | None) -> dict:
+    """Describe one input file: recorded path + SHA256 digest (if readable)."""
+    recorded = str(path) if path is not None else filename
+    digest = sha256_file(path) if path is not None else None
+    return {"path": recorded, "sha256": digest}
+
+
+def _initial_state_index(network: Network) -> dict[str, str]:
+    """Map link id (upper-cased) -> initial OPEN/CLOSED state."""
+    states: dict[str, str] = {}
+    for link in list(network.pumps) + list(network.valves):
+        states[link.id.upper()] = link.initial_status.upper()
+    return states
+
+
+def _resolve_actuator_states(
+    plcs: list[Plc], initial_states: dict[str, str]
+) -> dict[str, str]:
+    """Per-actuator initial state, keyed by the id used in plcs.yaml.
+
+    Actuators that are not declared in the INP fall back to ``OPEN``, matching
+    the EPANET default for links absent from [STATUS].
+    """
+    resolved: dict[str, str] = {}
+    for plc in plcs:
+        for actuator in plc.actuators:
+            resolved[actuator] = initial_states.get(actuator.upper(), "OPEN")
+    return resolved
+
+
+def _state_initial_value(status: str) -> int:
+    """Map an initial status to the ``_State`` integer encoding (1=OPEN, 0=CLOSED)."""
+    return 1 if status.upper() == "OPEN" else 0
+
+
 def _manifest_to_dict(m: Manifest) -> dict:
     return {
         "topology": m.topology,
@@ -84,6 +173,7 @@ def _manifest_to_dict(m: Manifest) -> dict:
         "plcs_yaml": m.plcs_yaml,
         "generated_at": m.generated_at,
         "plcs": m.plcs,
+        "provenance": m.provenance,
     }
 
 
@@ -110,6 +200,7 @@ def _render_plc(
     topology: str,
     inp_filename: str = "",
     plcs_filename: str = "",
+    actuator_states: dict[str, str] | None = None,
 ) -> tuple[str, list[dict], list[dict]]:
     """Return (file_text, fsms_meta, sensors_referenced_meta)."""
     case_blocks: list[str] = []
@@ -117,6 +208,7 @@ def _render_plc(
     output_decls: list[str] = []
     sensors_used: list[str] = []
     fsms: list[dict] = []
+    states = actuator_states or {}
 
     for act in plc.actuators:
         ctrls = controls_by_link.get(act, [])
@@ -125,7 +217,8 @@ def _render_plc(
         block, fsm_meta, sensors_in_block = _render_case_block(act, ctrls)
         case_blocks.append(block)
         act_id = _iec_ident(act)
-        state_var_decls.append(f"    {act_id}_State : INT := 0;")
+        init_state = _state_initial_value(states.get(act, "OPEN"))
+        state_var_decls.append(f"    {act_id}_State : INT := {init_state};")
         output_decls.append(f"    {act_id} : BOOL;")
         sensors_used.extend(sensors_in_block)
         fsms.append(fsm_meta)
@@ -146,12 +239,12 @@ def _render_plc(
         {"id": s, "owner_plc": sensor_owner.get(s, "")} for s in sensors_ordered
     ]
 
+    header = _render_header(topology, plc.name, inp_filename, plcs_filename)
+
     if not case_blocks:
         return (
-            f"(* Auto-generated by st_gen from {inp_filename} + {plcs_filename}\n"
-            f"   Topology: {topology}   PLC: {plc.name}\n"
-            f"   DO NOT EDIT. *)\n\n"
-            f"PROGRAM {plc.name}\n"
+            header
+            + f"\nPROGRAM {plc.name}\n"
             f"(* No actuators with [CONTROLS] entries -- sensor-only or "
             f"static-setting PLC. *)\n"
             f"END_PROGRAM\n",
@@ -159,21 +252,39 @@ def _render_plc(
             sensors_referenced,
         )
 
-    header = (
-        f"(* Auto-generated by st_gen from {inp_filename} + {plcs_filename}\n"
-        f"   Topology: {topology}   PLC: {plc.name}\n"
-        f"   DO NOT EDIT. *)\n\n"
-        f"PROGRAM {plc.name}\n"
-    )
-    if var_input_lines:
-        header += "VAR_INPUT\n" + "\n".join(var_input_lines) + "\nEND_VAR\n"
-    if output_decls:
-        header += "VAR_OUTPUT\n" + "\n".join(output_decls) + "\nEND_VAR\n"
-    if state_var_decls:
-        header += "VAR\n" + "\n".join(state_var_decls) + "\nEND_VAR\n"
     body = "\n".join(case_blocks) + "\n"
     footer = "END_PROGRAM\n"
-    return header + "\n" + body + footer, fsms, sensors_referenced
+    return header + f"\nPROGRAM {plc.name}\n" + _var_blocks(
+        var_input_lines, output_decls, state_var_decls
+    ) + "\n" + body + footer, fsms, sensors_referenced
+
+
+def _render_header(
+    topology: str, plc_name: str, inp_filename: str, plcs_filename: str
+) -> str:
+    """Return the ST header comment, including the surrogate provenance note."""
+    note = "\n".join(f"   {line}" for line in SURROGATE_HEADER_LINES)
+    return (
+        f"(* Auto-generated by {GENERATOR_NAME} {GENERATOR_VERSION} "
+        f"from {inp_filename} + {plcs_filename}\n"
+        f"   Topology: {topology}   PLC: {plc_name}\n"
+        f"{note}\n"
+        f"   DO NOT EDIT. *)\n"
+    )
+
+
+def _var_blocks(
+    var_input_lines: list[str], output_decls: list[str], state_var_decls: list[str]
+) -> str:
+    """Return the VAR_INPUT / VAR_OUTPUT / VAR declaration blocks."""
+    out = ""
+    if var_input_lines:
+        out += "VAR_INPUT\n" + "\n".join(var_input_lines) + "\nEND_VAR\n"
+    if output_decls:
+        out += "VAR_OUTPUT\n" + "\n".join(output_decls) + "\nEND_VAR\n"
+    if state_var_decls:
+        out += "VAR\n" + "\n".join(state_var_decls) + "\nEND_VAR\n"
+    return out
 
 
 def _render_var_input_line(sensor: str, owner: dict[str, str], this_plc: str) -> str:
@@ -218,6 +329,7 @@ def _render_case_block(
 
     # state 0 (CLOSED): transitions that flip to OPEN
     lines.append("    0:  (* CLOSED *)")
+    lines.append(f"        {act_id} := FALSE;")
     for c in open_trans:
         sensors.append(c.sensor_node)
         op = "<" if c.comparator == "BELOW" else ">"
@@ -228,6 +340,7 @@ def _render_case_block(
 
     # state 1 (OPEN): transitions that flip to CLOSED
     lines.append("    1:  (* OPEN *)")
+    lines.append(f"        {act_id} := TRUE;")
     for c in closed_trans:
         sensors.append(c.sensor_node)
         op = "<" if c.comparator == "BELOW" else ">"
@@ -237,7 +350,6 @@ def _render_case_block(
         lines.append("        END_IF;")
 
     lines.append("END_CASE;")
-    lines.append(f"{act_id} := ({act_id}_State = 1);")
     block = "\n".join(lines) + "\n"
     fsm_meta = {
         "actuator": actuator,
