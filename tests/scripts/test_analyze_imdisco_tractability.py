@@ -9,7 +9,7 @@ import pytest
 from baselines.imdisco import (
     IMDISCO,
     IMDISCOConfig,
-    _infer_columns,
+    _prune_subsumed,
     derive_predicates,
 )
 from scripts import analyze_imdisco_tractability as audit
@@ -112,6 +112,7 @@ def test_small_frame_parity_with_real_baseline_miner():
         mode_column="mode",
         sensor_columns=("velocity", "accel"),
         actuator_columns=("door",),
+        prune_subsumed_rules=False,
     )
     report, _ = audit.analyze_training_frame(frame, config)
     model = IMDISCO(config).fit(frame)
@@ -120,9 +121,11 @@ def test_small_frame_parity_with_real_baseline_miner():
     assert report["min_support_count"] == math.ceil(0.05 * 6)
     assert report["existing_guard"]["would_raise_mining_too_large"] is False
     assert _decimal(report["uncapped_totals"]["frequent_itemsets"]) == model._mining["n_frequent_itemsets"]
-    assert _decimal(report["uncapped_totals"]["retained_mode_consequent_rules"]) == len(model.rules)
-    assert report["uncapped_totals"]["frequent_itemsets"]["formula"] == "4*2^6 - 2"
-    assert report["uncapped_totals"]["retained_mode_consequent_rules"]["formula"] == "2*2^6 - 2"
+    assert _decimal(report["uncapped_totals"]["final_maximal_rules"]) == len(
+        _prune_subsumed(model.rules)
+    )
+    assert report["uncapped_totals"]["retained_mode_consequent_rules"]["status"] == "not_derived"
+    assert report["item_semantics"]["state_items_shared_across_modes"] is True
 
 
 def test_existing_guard_uses_predicate_powerset_estimate():
@@ -133,13 +136,15 @@ def test_existing_guard_uses_predicate_powerset_estimate():
     })
     config = IMDISCOConfig(mode_column="mode", max_frequent_itemsets=100)
     report, _ = audit.analyze_training_frame(frame, config)
-    # MinMax + Gradient + State + SteadyTime = four predicates plus mode.
-    assert _decimal(report["existing_guard"]["estimated_frequent_itemsets"]) == 2**5 - 1
+    # MinMax + within-mode Gradient + shared State; final SteadyTime is ongoing.
+    # The frame-start pattern is a subset of the four-item later-row pattern.
+    assert _decimal(report["existing_guard"]["estimated_frequent_itemsets"]) == 2**4 - 1
     assert report["existing_guard"]["would_raise_mining_too_large"] is False
     assert report["feature_roles"]["sensor_count"] == 1
     assert report["feature_roles"]["actuator_count"] == 1
-    assert report["modes"][0]["unique_transaction_patterns"] == 1
-    assert report["modes"][0]["transaction_widths_including_mode"] == [5]
+    assert report["unique_transaction_patterns"] == 2
+    assert report["predicate_count"] == 3
+    assert report["shared_state_predicate_count"] == 1
 
 
 def test_observable_policy_excludes_every_hidden_channel_before_predicates():
@@ -168,7 +173,7 @@ def test_observable_policy_excludes_every_hidden_channel_before_predicates():
 
     filtered = observable.copy()
     filtered["mode"] = frame["mode"]
-    sensors, actuators = _infer_columns(filtered, "mode")
+    sensors, actuators = ("observable_sensor",), ("s_observable",)
     predicates = derive_predicates(
         filtered, filtered["mode"], sensors, actuators
     )
@@ -176,11 +181,14 @@ def test_observable_policy_excludes_every_hidden_channel_before_predicates():
         "observable_sensor", "s_observable"
     }
     assert {predicate.kind for predicate in predicates} == {
-        "minmax", "gradient", "state", "steadytime"
+        "minmax", "gradient", "state"
     }
 
     report, _ = audit.analyze_training_frame(
-        frame, IMDISCOConfig(mode_column="mode")
+        frame,
+        IMDISCOConfig(
+            mode_column="mode", sensor_columns=sensors, actuator_columns=actuators
+        ),
     )
     policy = report["observable_policy"]
     assert policy["excluded_columns"] == sorted({
@@ -189,10 +197,32 @@ def test_observable_policy_excludes_every_hidden_channel_before_predicates():
     })
     assert policy["excluded_prefixes"] == ["leak_", "demand_", "emitter_"]
     assert policy["remaining_numeric_feature_count"] == 2
-    assert policy["remaining_feature_counts_after_role_inference"] == {
+    assert policy["remaining_feature_counts_by_topology_role"] == {
         "sensors": 1, "actuators": 1, "total": 2
     }
+    assert policy["feature_roles"] == {
+        "sensors": ["observable_sensor"], "actuators": ["s_observable"]
+    }
+    assert policy["feature_trimming"] is False
+    assert policy["episode_trimming"] is False
     assert set(policy["removed_columns"]) == set(source.columns) - set(observable.columns)
     assert "time_seconds" not in report["feature_roles"]["sensors"]
     assert report["feature_roles"]["time_seconds_is_sensor"] is False
     assert len(policy["observable_frame_sha256"]) == 64
+
+
+def test_runner_roles_come_from_topology_not_binary_cardinality():
+    train = pd.DataFrame({
+        "s_mapped_float": [0.0, 1.0],
+        "s_binary_but_sensor": [0, 1],
+        "s_continuous": [1.5, 2.5],
+        "mode": ["a", "b"],
+    })
+    sensors, actuators = runner.topology_feature_roles(
+        train, {("PLC1", "P1_State"): "s_mapped_float"}
+    )
+    assert actuators == ("s_mapped_float",)
+    assert sensors == ("s_binary_but_sensor", "s_continuous")
+    assert runner.OUT_ROOT.name == "full_signal_imdisco_maximal"
+    assert runner.UNCAPPED_OUT_ROOT.name == "full_signal_imdisco"
+    assert runner.OUT_ROOT != runner.UNCAPPED_OUT_ROOT

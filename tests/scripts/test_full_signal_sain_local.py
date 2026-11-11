@@ -3,13 +3,26 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 from baselines.sain import mine_local_invariants
 from scripts.run_full_signal_sain_local import (
+    OUT_ROOT,
+    QUANTMINER_OUT_ROOT,
+    _resolve_out_root,
     mining_feature_columns,
     pooled_detection_metrics,
 )
 from stl.metrics import detection_metrics
+
+
+def test_engine_default_output_roots_are_separate(tmp_path):
+    assert _resolve_out_root(None, "niaarm") == OUT_ROOT
+    assert _resolve_out_root(None, "quantminer") == QUANTMINER_OUT_ROOT
+    assert QUANTMINER_OUT_ROOT != OUT_ROOT
+    assert _resolve_out_root(tmp_path, "quantminer") == tmp_path
+    with pytest.raises(ValueError, match="unsupported"):
+        _resolve_out_root(None, "other")
 
 
 def test_mining_features_exclude_component_states_and_simulator_truth():

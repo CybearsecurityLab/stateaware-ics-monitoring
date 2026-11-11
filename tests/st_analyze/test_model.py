@@ -18,3 +18,4 @@ def test_analyze_result_defaults():
     assert r.ok is True
     assert r.errors == []
     assert r.programs == []
+    assert r.pdg_components == []

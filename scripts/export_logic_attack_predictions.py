@@ -79,16 +79,24 @@ PREDICTION_COLUMNS = [
     "y_true",
     "y_true_observation_aware",
     "y_pred_gfsm",
+    "y_pred_gfsm_timing",
+    "y_pred_gfsm_obligations",
     "y_pred_phi",
     "y_pred_stl",
     "y_pred",
+    "y_pred_combined_obligations",
     "phi_score",
+    "gfsm_obligation_score",
     "stl_score",
     "combined_score",
+    "combined_obligations_score",
     "uncalibrated_count",
 ]
 
-ARM_NAMES = ("gfsm", "phi", "stl", "combined")
+ARM_NAMES = (
+    "gfsm", "gfsm_timing", "gfsm_obligations", "phi", "stl", "combined",
+    "combined_obligations",
+)
 
 
 class LogicAttackExportError(RuntimeError):
@@ -199,9 +207,15 @@ def metrics(frame: pd.DataFrame, nominal_mask: pd.Series,
     }
     arms = {
         "gfsm": (frame["y_pred_gfsm"].to_numpy(), frame["y_pred_gfsm"].to_numpy(float)),
+        "gfsm_timing": (frame["y_pred_gfsm_timing"].to_numpy(), frame["y_pred_gfsm_timing"].to_numpy(float)),
+        "gfsm_obligations": (frame["y_pred_gfsm_obligations"].to_numpy(), frame["gfsm_obligation_score"].to_numpy()),
         "phi": (frame["y_pred_phi"].to_numpy(), frame["phi_score"].to_numpy()),
         "stl": (frame["y_pred_stl"].to_numpy(), frame["stl_score"].to_numpy()),
         "combined": (frame["y_pred"].to_numpy(), frame["combined_score"].to_numpy()),
+        "combined_obligations": (
+            frame["y_pred_combined_obligations"].to_numpy(),
+            frame["combined_obligations_score"].to_numpy(),
+        ),
     }
     for arm, (prediction, score) in arms.items():
         values = export.detection_metrics(
@@ -298,6 +312,11 @@ def export_topology(
 
         stl_flags = group["stl"].to_numpy()
         gfsm_flags = group["gfsm"].to_numpy()
+        timing_flags = group["gfsm_timing"].to_numpy()
+        obligation_flags = group["gfsm_obligations"].to_numpy()
+        obligation_scores = group["gfsm_obligation_score"].to_numpy()
+        combined_obligation_flags = group["combined_obligations"].to_numpy()
+        combined_obligation_scores = group["combined_obligations_score"].to_numpy()
         phi_flags = group["phi"].to_numpy()
         combined_flags = group["combined"].to_numpy()
         stl_scores = group["stl_score"].to_numpy()
@@ -312,6 +331,18 @@ def export_topology(
         ):
             raise LogicAttackExportError(
                 f"{topology}/{name}: combined score is not max(STL, GFSM, Phi)")
+        expected_obligations = np.logical_or.reduce(
+            (stl_flags, obligation_flags, phi_flags)
+        ).astype(int)
+        if not np.array_equal(combined_obligation_flags, expected_obligations):
+            raise LogicAttackExportError(
+                f"{topology}/{name}: obligation fusion is not GFSM_obligations OR Phi OR STL")
+        if not np.allclose(
+            combined_obligation_scores,
+            np.maximum.reduce((stl_scores, obligation_scores, phi_scores)),
+        ):
+            raise LogicAttackExportError(
+                f"{topology}/{name}: obligation fused score is not max(STL, obligations, Phi)")
 
         times = frame["time_seconds"].to_numpy()
         start = len(rows)
@@ -326,12 +357,17 @@ def export_topology(
                 "y_true": int(group["y_true"].iloc[index]),
                 "y_true_observation_aware": int(observation_aware[index]),
                 "y_pred_gfsm": int(gfsm_flags[index]),
+                "y_pred_gfsm_timing": int(timing_flags[index]),
+                "y_pred_gfsm_obligations": int(obligation_flags[index]),
                 "y_pred_phi": int(phi_flags[index]),
                 "y_pred_stl": int(stl_flags[index]),
                 "y_pred": int(combined_flags[index]),
+                "y_pred_combined_obligations": int(combined_obligation_flags[index]),
                 "phi_score": float(phi_scores[index]),
+                "gfsm_obligation_score": float(obligation_scores[index]),
                 "stl_score": float(stl_scores[index]),
                 "combined_score": float(combined_scores[index]),
+                "combined_obligations_score": float(combined_obligation_scores[index]),
                 "uncalibrated_count": int(group["unknown"].iloc[index]),
             })
 
@@ -343,7 +379,9 @@ def export_topology(
         _log(
             f"{topology}/{name}: rows={len(group)} attack={int(truth.sum())} "
             f"stl_flags={int(stl_flags.sum())} gfsm_flags={int(gfsm_flags.sum())} "
-            f"phi_flags={int(phi_flags.sum())}"
+            f"phi_flags={int(phi_flags.sum())} "
+            f"timing_flags={int(timing_flags.sum())} "
+            f"obligation_flags={int(obligation_flags.sum())}"
         )
 
     if not rows:
@@ -381,7 +419,7 @@ def export_topology(
         inputs[plan["path"]] = plan["sha256"]
 
     result = {
-        "schema": "logic-attack-predictions/v2",
+        "schema": "logic-attack-predictions/v3",
         "topology": topology,
         "generated_at_unix": int(started),
         "runtime_seconds": round(time.time() - started, 3),
@@ -396,6 +434,8 @@ def export_topology(
             "output_namespace": output_namespace,
             "tuned_on_attacks": False,
             "fusion": "GFSM OR Phi OR STL",
+            "obligation_fusion": "GFSM_obligations OR Phi OR STL",
+            "gfsm_obligation_timing": "previous observation supplies guards; next observation supplies actuator feedback",
             "unknown_policy": export.DEFAULT_UNKNOWN_POLICY,
             "scenarios": list(prepared["scenarios"]),
         },
@@ -411,6 +451,14 @@ def export_topology(
             "coverage": artifact.get("coverage"),
         },
         "gfsm": {"column_mapping": prepared["mapping"]},
+        "gfsm_obligations": {
+            "semantics": "previous-input transition guards plus next-observation action realization",
+            "first_observation_policy": "no prior command history; no new obligation",
+            "reason_counts": {
+                name: len(reasons)
+                for name, reasons in prepared["obligation_reasons"].items()
+            },
+        },
         "phi": {
             key: prepared["phi"].model[key]
             for key in (
@@ -448,6 +496,7 @@ def export_topology(
                     Path(__file__), Path(sweep.__file__),
                     REPO_ROOT / "src/invariants/full_signal_phi.py",
                     REPO_ROOT / "src/monitor/gfsm_detector.py",
+                    REPO_ROOT / "src/monitor/gfsm_obligations.py",
                     REPO_ROOT / "src/stl/topology_detector.py",
                 )
             },

@@ -3,8 +3,8 @@
 This module is the separately named **local-vs-global adaptation**
 (:class:`SainLocalDetector`), not the paper-faithful native SAIN path.  The
 source-derived, per-global-state implementation is in
-:mod:`baselines.sain_native`; NiaARM is used only here and must never be
-described as native SAIN.
+:mod:`baselines.sain_native`.  The local adaptation has separate NiaARM and
+official QuantMiner mining engines; neither engine is native SAIN.
 
 Upstream reference (official, cited here so the baseline is traceable)
 ---------------------------------------------------------------------
@@ -30,11 +30,13 @@ the repository's existing machinery:
   CASE selector) gets its own state partition and its own rule set, mined
   separately, instead of the cross-product composite state used by the
   ``invariants`` stage;
-* the rules are mined with the repository's existing NiaARM miner
-  (:func:`invariants.mine.mine_state`) and the same quality filter
-  (confidence >= 0.7, support >= 0.1);
-* the violation threshold is selected per component on a **validation**
-  split, so no threshold is calibrated on the rows its rules were fitted on.
+* the legacy NiaARM engine uses :func:`invariants.mine.mine_state`; the
+  QuantMiner engine uses the official vendored Java implementation through
+  :func:`baselines.quantminer.run_quantminer` and evaluates the rules parsed
+  from its actual ``rules.csv`` output;
+* both engines use confidence >= 0.7 and support >= 0.1, and the violation
+  threshold is selected per component on a **validation** split, so no
+  threshold is calibrated on the rows its rules were fitted on.
 
 This is **not** a byte-exact reproduction of the official SAIN artifact and
 must not be described as one.  The adaptations are:
@@ -44,12 +46,13 @@ must not be described as one.  The adaptations are:
    when an invariant would be violated.  Here the monitor is passive: it
    scores recorded trace rows after the fact.  Nothing is blocked, and no
    request-level causality is modelled.
-2. **NiaARM instead of Quantminer.**  The official implementation quantifies
-   invariant templates with Quantminer.  Quantminer's configuration is not
-   reproducible here, so the association-rule miner already vendored in this
-   repository (NiaARM + Niapy PSO, with the same confidence/support filter)
-   is used instead.  The mined rules are therefore association rules, not
-   the paper's single-variable/multi-variable bound templates.
+2. **Association-rule mining adaptation.**  The NiaARM engine retains the
+   repository's earlier NiaARM + Niapy PSO adaptation.  The QuantMiner engine
+   instead runs the official QuantMiner Java code at the commit recorded in
+   the model, with an explicitly reported experimental configuration.  That
+   configuration is not claimed to be SAIN's original configuration, and the
+   resulting association rules are not the paper's source-derived invariant
+   templates.
 3. **Surrogate PLC ST.**  The official artifact ships the real Structured
    Text of its Fischertechnik and Tennessee Eastman testbeds.  Here the PLC
    programs are the surrogate/generated ST of this repository, so the state
@@ -73,7 +76,10 @@ component is flagged as an *unknown local state*.
 
 from __future__ import annotations
 
+import csv
+import hashlib
 import json
+import re
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -82,24 +88,30 @@ from typing import Any, Protocol, Sequence
 import numpy as np
 import pandas as pd
 
+from baselines.quantminer import QuantMinerConfig, run_quantminer
 from invariants.mine import MinerConfig, mine_state
-from invariants.model import InvariantsError, MinedRule
+from invariants.model import Atom, InvariantsError, MinedRule
 from invariants.rule_eval import frame_violation_counts
 from invariants.threshold import select_violation_threshold
 
 from monitor.protocol import StepFlags
 
 __all__ = [
+    "QUANTMINER_CODE_COMMIT",
     "SAIN_CODE_COMMIT",
     "SAIN_CODE_URL",
     "SAIN_PAPER_URL",
     "SAIN_ADAPTATIONS",
+    "SAIN_QUANTMINER_ADAPTATIONS",
+    "SAIN_QUANTMINER_CONFIG",
     "SAIN_SCHEMA",
     "ComparisonScenario",
+    "QuantMinerRuleError",
     "SainLocalDetector",
     "compare_local_vs_global",
     "local_state_ids",
     "mine_local_invariants",
+    "parse_quantminer_rules",
     "run_sain_local_comparison",
 ]
 
@@ -128,7 +140,46 @@ SAIN_ADAPTATIONS: tuple[str, ...] = (
     "calibrated separately instead of per global ICS state",
 )
 
+#: Official QuantMiner commit vendored by :mod:`baselines.quantminer`.
+QUANTMINER_CODE_COMMIT = "587eea87c3603a2e0ef0e4b032422ffdedf5b645"
+SAIN_QUANTMINER_CONFIG = QuantMinerConfig(
+    min_support=0.1,
+    min_confidence=0.7,
+    population=250,
+    generations=100,
+    max_attributes=2,
+)
+
+#: Adaptations for the official-QuantMiner local engine.  In particular, the
+#: numeric settings used here are experiment settings, not a claim to recover
+#: an unavailable original SAIN configuration.
+SAIN_QUANTMINER_ADAPTATIONS: tuple[str, ...] = (
+    "this class is the local per-CASE-state adaptation, not native SAIN; "
+    "the source-derived per-global-state path is baselines.sain_native",
+    "passive per-row monitor (upstream SMONITOR is an active PLC-runtime "
+    "write-request interceptor; here violations are only scored on recorded "
+    "rows, nothing is denied and SMONITOR is not reproduced)",
+    "official vendored QuantMiner Java association-rule mining with the "
+    "reported experimental configuration; this is not claimed to be SAIN's "
+    "original QuantMiner configuration or source-template quantification",
+    "two-attribute local rule cap approved for tractability; the failed "
+    "three-attribute full-width run is preserved separately and is not "
+    "presented as the same mining configuration",
+    "exact state-local constant channels are excluded only from QuantMiner "
+    "input and retained as separately recorded point-interval invariants; "
+    "every nonconstant observable feature is retained and all constants are named",
+    "surrogate/generated PLC Structured Text replaces the upstream testbed "
+    "programs; the state partition comes from the GFSM CASE selectors, not "
+    "from SAIN's PDG-based FSM extraction",
+    "local per-CASE-state granularity: each component is mined and "
+    "calibrated separately instead of per global ICS state",
+)
+
 SAIN_SCHEMA = "baselines/sain_local/v1"
+
+
+class QuantMinerRuleError(ValueError):
+    """An official QuantMiner CSV row cannot be represented losslessly."""
 
 
 def local_state_ids(frame: pd.DataFrame, column: str) -> np.ndarray:
@@ -151,6 +202,106 @@ def local_state_ids(frame: pd.DataFrame, column: str) -> np.ndarray:
             "derive the local state"
         )
     return values.astype(int).astype(str)
+
+
+_QUANTMINER_NUMBER = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][+-]?\d+)?"
+_QUANTMINER_INTERVAL = re.compile(
+    rf"^(?P<column>.+?)\s+in\s+\[\s*(?P<lo>{_QUANTMINER_NUMBER})\s*;"
+    rf"\s*(?P<hi>{_QUANTMINER_NUMBER})\s*\]$"
+)
+_QUANTMINER_PERCENT = re.compile(
+    rf"^(?P<value>{_QUANTMINER_NUMBER})\s*%$"
+)
+_QUANTMINER_REQUIRED_COLUMNS = {
+    "Left", "Right", "Support[L and R]", "Confidence[L->R]",
+}
+
+
+def _quantminer_percentage(value: Any, *, column: str, row_number: int) -> float:
+    text = "" if value is None else str(value).strip()
+    match = _QUANTMINER_PERCENT.fullmatch(text)
+    if match is None:
+        raise QuantMinerRuleError(
+            f"QuantMiner rules.csv row {row_number}: {column} must be a "
+            f"numeric percentage, got {value!r}"
+        )
+    return float(match.group("value")) / 100.0
+
+
+def _quantminer_atoms(text: Any, *, side: str, row_number: int) -> list[Atom]:
+    if text is None or not str(text).strip():
+        raise QuantMinerRuleError(
+            f"QuantMiner rules.csv row {row_number}: empty {side} side"
+        )
+    atoms = []
+    # QuantMiner writes two spaces around AND.  Whitespace-flexible splitting
+    # accepts that exact output as well as single-spaced CSV fixtures.
+    for raw in re.split(r"\s+AND\s+", str(text).strip()):
+        value = raw.strip()
+        match = _QUANTMINER_INTERVAL.fullmatch(value)
+        if re.search(r"\s+(?:OR|NOT)\s+", value):
+            match = None
+        if match is None:
+            raise QuantMinerRuleError(
+                f"QuantMiner rules.csv row {row_number}: unsupported {side} "
+                f"atom {value!r}; only numeric '<column> in [<lo>; <hi>]' "
+                "atoms and compound ' AND ' are supported"
+            )
+        column = match.group("column").strip()
+        if not column:
+            raise QuantMinerRuleError(
+                f"QuantMiner rules.csv row {row_number}: empty column in "
+                f"{side} atom {value!r}"
+            )
+        atoms.append(Atom(
+            col=column,
+            op="in",
+            val=[float(match.group("lo")), float(match.group("hi"))],
+        ))
+    return atoms
+
+
+def parse_quantminer_rules(path: Path | str) -> list[MinedRule]:
+    """Parse official QuantMiner ``rules.csv`` into the invariant rule schema.
+
+    ``Left`` is the antecedent and ``Right`` the consequent.  QuantMiner's
+    inclusive numeric intervals map directly to inclusive ``in`` atoms.  The
+    local arm has numeric-only inputs, so categorical atoms and every other
+    operator are rejected instead of being silently discarded or approximated.
+    """
+    path = Path(path)
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        fields = set(reader.fieldnames or [])
+        missing = sorted(_QUANTMINER_REQUIRED_COLUMNS.difference(fields))
+        if missing:
+            raise QuantMinerRuleError(
+                f"QuantMiner rules.csv is missing required columns: {missing}"
+            )
+        rules = []
+        for row_number, row in enumerate(reader, start=2):
+            if None in row:
+                raise QuantMinerRuleError(
+                    f"QuantMiner rules.csv row {row_number}: too many CSV fields"
+                )
+            rules.append(MinedRule(
+                id=f"quantminer-{row_number - 1:06d}",
+                antecedent=_quantminer_atoms(
+                    row.get("Left"), side="Left", row_number=row_number,
+                ),
+                consequent=_quantminer_atoms(
+                    row.get("Right"), side="Right", row_number=row_number,
+                ),
+                support=_quantminer_percentage(
+                    row.get("Support[L and R]"),
+                    column="Support[L and R]", row_number=row_number,
+                ),
+                confidence=_quantminer_percentage(
+                    row.get("Confidence[L->R]"),
+                    column="Confidence[L->R]", row_number=row_number,
+                ),
+            ))
+    return rules
 
 
 @dataclass
@@ -224,6 +375,109 @@ def _mine_component(
     return model, all_ok
 
 
+def _quantminer_component(
+    *,
+    plc: str,
+    case_var: str,
+    column: str,
+    train_df: pd.DataFrame,
+    feature_cols: list[str],
+    cfg: QuantMinerConfig,
+    min_observations: int,
+    keep_going: bool,
+    artifact_dir: Path,
+) -> tuple[_ComponentModel, bool]:
+    """Mine and parse actual official QuantMiner rules for one component."""
+    model = _ComponentModel(plc=plc, case_var=case_var, column=column)
+    ids = local_state_ids(train_df, column)
+    all_ok = True
+    for state_id in sorted(set(ids.tolist())):
+        slice_df = train_df.loc[ids == state_id]
+        nobs = int(len(slice_df))
+        if nobs < min_observations:
+            model.states[state_id] = {
+                "observations": nobs,
+                "status": "insufficient_data",
+                "rule_count": 0,
+                "rules": [],
+            }
+            continue
+        mining_columns = [
+            column for column in feature_cols
+            if slice_df[column].max() > slice_df[column].min()
+        ]
+        removed_constant = [
+            column for column in feature_cols if column not in mining_columns
+        ]
+        constant_rules = []
+        for column in removed_constant:
+            value = float(slice_df[column].iloc[0])
+            if not np.isfinite(value):
+                raise InvariantsError(
+                    f"cannot build a point invariant for {model.key} state "
+                    f"{state_id} column {column}: missing or nonfinite value"
+                )
+            constant_rules.append(MinedRule(
+                id=f"state-local-constant-{model.key}-{state_id}-{column}",
+                antecedent=[],
+                consequent=[Atom(col=column, op="in", val=[value, value])],
+                support=1.0,
+                confidence=1.0,
+            ))
+        safe_state = re.sub(r"[^A-Za-z0-9_.-]+", "_", state_id)
+        state_digest = hashlib.sha256(state_id.encode("utf-8")).hexdigest()[:12]
+        state_dir = Path(artifact_dir) / f"state_{safe_state}_{state_digest}"
+        if not mining_columns:
+            model.states[state_id] = {
+                "observations": nobs,
+                "status": "constant_only",
+                "mining_feature_columns": [],
+                "removed_constant_columns": removed_constant,
+                "constant_invariant_count": len(constant_rules),
+                "rule_count": len(constant_rules),
+                "official_rule_count": 0,
+                "rules": [rule.to_dict() for rule in constant_rules],
+            }
+            continue
+        try:
+            result = run_quantminer(
+                slice_df.loc[:, mining_columns], state_dir, cfg,
+            )
+            official_rules = parse_quantminer_rules(result["rules_path"])
+            official_count = int(result["provenance"]["rule_count"])
+            if official_count != len(official_rules):
+                raise QuantMinerRuleError(
+                    f"QuantMiner rule count mismatch for {model.key} state "
+                    f"{state_id}: provenance={official_count}, parsed={len(official_rules)}"
+                )
+            rules = [*constant_rules, *official_rules]
+            model.states[state_id] = {
+                "observations": nobs,
+                "status": "ok",
+                "mining_feature_columns": mining_columns,
+                "removed_constant_columns": removed_constant,
+                "constant_invariant_count": len(constant_rules),
+                "rule_count": len(rules),
+                "official_rule_count": official_count,
+                "rules_path": str(result["rules_path"]),
+                "quantminer_provenance": result["provenance"],
+                "rules": [rule.to_dict() for rule in rules],
+            }
+        except Exception as exc:  # noqa: BLE001 - mining is best-effort
+            all_ok = False
+            model.states[state_id] = {
+                "observations": nobs,
+                "status": "mining_error",
+                "rule_count": 0,
+                "errors": [repr(exc)],
+                "artifact_dir": str(state_dir),
+                "rules": [],
+            }
+            if not keep_going:
+                break
+    return model, all_ok
+
+
 def _calibrate_component(
     model: _ComponentModel,
     val_df: pd.DataFrame,
@@ -268,6 +522,9 @@ def mine_local_invariants(
     fp_budget: float = 0.01,
     keep_going: bool = True,
     n_jobs: int = 1,
+    engine: str = "niaarm",
+    quantminer_dir: Path | str | None = None,
+    max_attributes: int | None = None,
 ) -> dict[str, Any]:
     """Mine the local (per-CASE-state) SAIN-style invariant model.
 
@@ -279,7 +536,9 @@ def mine_local_invariants(
 
     ``feature_cols`` is used verbatim for every component, so the local
     model and the global ``invariants`` stage can be compared on identical
-    feature columns.
+    feature columns.  ``engine='niaarm'`` preserves the legacy miner.
+    ``engine='quantminer'`` runs official QuantMiner and requires a separate
+    ``quantminer_dir`` for its raw per-component/per-state artifacts.
     """
     if not training_frames:
         raise InvariantsError("mine_local_invariants needs training frames")
@@ -288,34 +547,67 @@ def mine_local_invariants(
             "mine_local_invariants needs validation frames: the violation "
             "threshold must be selected on rows the rules were not fitted on"
         )
+    if engine not in {"niaarm", "quantminer"}:
+        raise ValueError(f"unsupported local SAIN mining engine: {engine!r}")
+    if engine == "niaarm" and max_attributes is not None:
+        raise ValueError("max_attributes applies only to the QuantMiner engine")
+    if engine == "quantminer" and quantminer_dir is None:
+        raise ValueError("quantminer_dir is required for the QuantMiner engine")
     train_df = pd.concat(list(training_frames), ignore_index=True)
     val_df = pd.concat(list(validation_frames), ignore_index=True)
     feature_cols = list(feature_cols)
 
     if n_jobs < 1:
         raise ValueError("n_jobs must be >= 1")
-    cfg = MinerConfig(max_evals=max_evals, seed=seed)
+    if engine == "niaarm":
+        cfg: MinerConfig | QuantMinerConfig = MinerConfig(
+            max_evals=max_evals, seed=seed,
+        )
+        worker = _mine_component
+    else:
+        if max_attributes is not None and max_attributes < 1:
+            raise ValueError("max_attributes must be >= 1")
+        cfg = (
+            SAIN_QUANTMINER_CONFIG if max_attributes is None
+            else QuantMinerConfig(
+                min_support=SAIN_QUANTMINER_CONFIG.min_support,
+                min_confidence=SAIN_QUANTMINER_CONFIG.min_confidence,
+                population=SAIN_QUANTMINER_CONFIG.population,
+                generations=SAIN_QUANTMINER_CONFIG.generations,
+                max_attributes=int(max_attributes),
+            )
+        )
+        worker = _quantminer_component
     models: dict[str, _ComponentModel] = {}
     all_ok = True
 
     jobs = []
-    for plc, case_var in components:
+    for index, (plc, case_var) in enumerate(components):
         column = fb_to_col.get((plc, case_var))
         if column is None:
             raise InvariantsError(
                 f"no dataset column resolved for component "
                 f"(plc={plc}, case_var={case_var!r})"
             )
-        jobs.append(dict(
+        job = dict(
             plc=plc, case_var=case_var, column=column,
             train_df=train_df, feature_cols=feature_cols, cfg=cfg,
             min_observations=min_observations, keep_going=keep_going,
-        ))
+        )
+        if engine == "quantminer":
+            key = f"{plc}.{case_var}"
+            safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", key)
+            key_digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
+            job["artifact_dir"] = (
+                Path(quantminer_dir)
+                / f"{index:03d}_{safe_key}_{key_digest}"
+            )
+        jobs.append(job)
     if n_jobs == 1:
-        results = [_mine_component(**job) for job in jobs]
+        results = [worker(**job) for job in jobs]
     else:
         with ProcessPoolExecutor(max_workers=n_jobs) as pool:
-            futures = [pool.submit(_mine_component, **job) for job in jobs]
+            futures = [pool.submit(worker, **job) for job in jobs]
             results = [future.result() for future in futures]
     for model, ok in results:
         models[model.key] = model
@@ -324,8 +616,9 @@ def mine_local_invariants(
     for model in models.values():
         _calibrate_component(model, val_df, fp_budget)
 
-    return {
+    result = {
         "schema": SAIN_SCHEMA,
+        "engine": engine,
         "topology": topology,
         "upstream": {
             "paper_url": SAIN_PAPER_URL,
@@ -333,17 +626,11 @@ def mine_local_invariants(
             "code_commit": SAIN_CODE_COMMIT,
             "reproduction": "not byte-exact; see adaptations",
         },
-        "adaptations": list(SAIN_ADAPTATIONS),
+        "adaptations": list(
+            SAIN_ADAPTATIONS if engine == "niaarm"
+            else SAIN_QUANTMINER_ADAPTATIONS
+        ),
         "granularity": "local_per_case_state",
-        "niaarm": {
-            "max_evals": int(max_evals),
-            "confidence_min": 0.7,
-            "support_min": 0.1,
-            "min_observations": int(min_observations),
-            "seed": int(seed),
-            "algorithm": "ParticleSwarmAlgorithm",
-            "n_jobs": int(n_jobs),
-        },
         "violation_fp_budget": float(fp_budget),
         "feature_cols": feature_cols,
         "calibration": {
@@ -355,6 +642,38 @@ def mine_local_invariants(
         "components": {k: m.to_dict() for k, m in models.items()},
         "all_ok": all_ok,
     }
+    if engine == "niaarm":
+        result["niaarm"] = {
+            "max_evals": int(max_evals),
+            "confidence_min": 0.7,
+            "support_min": 0.1,
+            "min_observations": int(min_observations),
+            "seed": int(seed),
+            "algorithm": "ParticleSwarmAlgorithm",
+            "n_jobs": int(n_jobs),
+        }
+    else:
+        quant_cfg = cfg
+        assert isinstance(quant_cfg, QuantMinerConfig)
+        result["quantminer"] = {
+            "implementation": "official_vendored_quantminer_java",
+            "official_commit": QUANTMINER_CODE_COMMIT,
+            "config": dict(quant_cfg.__dict__),
+            "min_observations": int(min_observations),
+            "seed": int(seed),
+            "seed_note": (
+                "experiment/split seed; the official QuantMiner CLI exposes "
+                "no random-seed control"
+            ),
+            "n_jobs": int(n_jobs),
+            "artifact_root": str(quantminer_dir),
+            "rule_count": sum(
+                len(state.get("rules") or [])
+                for model in models.values()
+                for state in model.states.values()
+            ),
+        }
+    return result
 
 
 class SainLocalDetector:

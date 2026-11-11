@@ -16,7 +16,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from baselines.sain import SainLocalDetector, mine_local_invariants  # noqa: E402
+from baselines.sain import (  # noqa: E402
+    QUANTMINER_CODE_COMMIT,
+    SAIN_QUANTMINER_CONFIG,
+    SainLocalDetector,
+    mine_local_invariants,
+)
 from dataio.full_signal import (  # noqa: E402
     discover_full_signal_runs,
     split_nominal_run,
@@ -30,6 +35,11 @@ from scripts.run_full_signal_hybrid import (  # noqa: E402
 from stl.metrics import detection_metrics  # noqa: E402
 
 OUT_ROOT = REPO_ROOT / "scripts/out/full_signal_sain_local"
+QUANTMINER_OUT_ROOT = REPO_ROOT / "scripts/out/full_signal_sain_local_quantminer"
+OUT_ROOTS = {
+    "niaarm": OUT_ROOT,
+    "quantminer": QUANTMINER_OUT_ROOT,
+}
 TOPOLOGIES = ("anytown", "ctown", "ltown")
 MIN_OBSERVATIONS = 50
 MAX_EVALS = 5000
@@ -153,6 +163,31 @@ def _local_state_report(model: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _rule_counts(model: dict[str, Any]) -> dict[str, Any]:
+    by_local_state = {
+        component: {
+            state_id: len(state.get("rules") or [])
+            for state_id, state in entry.get("local_states", {}).items()
+        }
+        for component, entry in model.get("components", {}).items()
+    }
+    by_component = {
+        component: sum(states.values())
+        for component, states in by_local_state.items()
+    }
+    return {
+        "total": sum(by_component.values()),
+        "by_component": by_component,
+        "by_local_state": by_local_state,
+    }
+
+
+def _resolve_out_root(out_root: Path | None, engine: str) -> Path:
+    if engine not in OUT_ROOTS:
+        raise ValueError(f"unsupported local SAIN mining engine: {engine!r}")
+    return Path(out_root) if out_root is not None else OUT_ROOTS[engine]
+
+
 def pooled_detection_metrics(predictions: pd.DataFrame) -> dict[str, Any]:
     """Recompute pooled metrics from the renderer-compatible prediction columns."""
     required = {"y_true", "y_pred", "score"}
@@ -173,9 +208,11 @@ def _base_result(
     mapping_report,
     feature_schema: dict[str, Any],
     n_jobs: int,
+    engine: str,
 ) -> dict[str, Any]:
-    return {
+    result = {
         "schema": "full-signal-sain-local/v1",
+        "engine": engine,
         "topology": topology,
         "granularity": "local_per_case_state",
         "config": {
@@ -209,13 +246,25 @@ def _base_result(
         },
         "skipped_runs": [item.to_dict() for item in discovery.skipped],
     }
+    if engine == "quantminer":
+        result["official_quantminer_commit"] = QUANTMINER_CODE_COMMIT
+        result["config"]["quantminer"] = dict(SAIN_QUANTMINER_CONFIG.__dict__)
+    return result
 
 
 def _remove_stale_predictions(out_dir: Path) -> None:
     (out_dir / "predictions.csv").unlink(missing_ok=True)
 
 
-def run_topology(topology: str, out_root: Path = OUT_ROOT, *, n_jobs: int = 1) -> dict[str, Any]:
+def run_topology(
+    topology: str,
+    out_root: Path | None = None,
+    *,
+    n_jobs: int = 1,
+    engine: str = "niaarm",
+    max_attributes: int | None = None,
+) -> dict[str, Any]:
+    out_root = _resolve_out_root(out_root, engine)
     discovery = discover_full_signal_runs(topology)
     nominal_split = split_nominal_run(discovery.nominal)
     components, fb_to_col, mapping_report = _resolve_components(
@@ -229,7 +278,8 @@ def run_topology(topology: str, out_root: Path = OUT_ROOT, *, n_jobs: int = 1) -
     out_dir = Path(out_root) / topology
     out_dir.mkdir(parents=True, exist_ok=True)
     result = _base_result(
-        topology, discovery, nominal_split, mapping_report, feature_schema, n_jobs,
+        topology, discovery, nominal_split, mapping_report, feature_schema,
+        n_jobs, engine,
     )
 
     train = observable_frame(nominal_split.train.frame)
@@ -254,6 +304,11 @@ def run_topology(topology: str, out_root: Path = OUT_ROOT, *, n_jobs: int = 1) -
             fp_budget=FP_BUDGET,
             keep_going=True,
             n_jobs=n_jobs,
+            engine=engine,
+            max_attributes=max_attributes,
+            quantminer_dir=(
+                out_dir / "quantminer" if engine == "quantminer" else None
+            ),
         )
     except Exception as exc:
         _remove_stale_predictions(out_dir)
@@ -275,12 +330,15 @@ def run_topology(topology: str, out_root: Path = OUT_ROOT, *, n_jobs: int = 1) -
     result.update({
         "status": "ok" if not mining_errors else "mining_errors",
         "model_sha256": model_sha256,
-        "niaarm": model["niaarm"],
         "adaptations": model["adaptations"],
+        "rule_counts": _rule_counts(model),
         "local_states": _local_state_report(model),
         "mining_errors": mining_errors,
         "model_all_ok": model["all_ok"],
     })
+    result[engine] = model[engine]
+    if engine == "quantminer":
+        result["config"]["quantminer"] = dict(model["quantminer"]["config"])
 
     detector = SainLocalDetector(model)
     metrics: dict[str, Any] = {}
@@ -330,14 +388,26 @@ def run_topology(topology: str, out_root: Path = OUT_ROOT, *, n_jobs: int = 1) -
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--topology", choices=TOPOLOGIES, required=True)
-    parser.add_argument("--out-root", type=Path, default=OUT_ROOT)
+    parser.add_argument("--engine", choices=tuple(OUT_ROOTS), default="niaarm")
+    parser.add_argument(
+        "--out-root", type=Path, default=None,
+        help="output root (default depends on --engine)",
+    )
     parser.add_argument("--jobs", type=int, default=1)
+    parser.add_argument(
+        "--max-attributes", type=int, choices=[2, 3], default=None,
+        help="QuantMiner numeric-attribute cap; default uses the project adaptation",
+    )
     args = parser.parse_args()
-    result = run_topology(args.topology, args.out_root, n_jobs=args.jobs)
+    out_root = _resolve_out_root(args.out_root, args.engine)
+    result = run_topology(
+        args.topology, out_root, n_jobs=args.jobs, engine=args.engine,
+        max_attributes=args.max_attributes,
+    )
     print(
-        f"{args.topology}: {result['status']}; "
+        f"{args.topology} ({args.engine}): {result['status']}; "
         f"{len(result.get('metrics', {}))} scenarios -> "
-        f"{Path(args.out_root) / args.topology}"
+        f"{out_root / args.topology}"
     )
     return 0
 

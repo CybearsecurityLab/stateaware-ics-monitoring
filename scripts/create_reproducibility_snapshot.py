@@ -21,6 +21,7 @@ DIRECTORIES = (
     "tests",
     "vendor",
     "data",
+    "review",
     "docs/papers",
     "scripts/out",
     "paper/State-Aware-ICS-Security",
@@ -29,6 +30,7 @@ ROOT_FILES = (
     "pyproject.toml",
     "uv.lock",
     "README.md",
+    "TODO.md",
     "INSTALL.md",
 )
 EXCLUDED_PARTS = {".git", ".worktrees", "__pycache__", ".pytest_cache"}

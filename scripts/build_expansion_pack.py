@@ -26,9 +26,12 @@ def ablation(topology: str) -> dict:
                          ("observation_aware", "y_true_observation_aware")):
         arms = {}
         for arm, flag, score in (("gfsm", "y_pred_gfsm", "y_pred_gfsm"),
+                                 ("gfsm_timing", "y_pred_gfsm_timing", "y_pred_gfsm_timing"),
+                                 ("gfsm_obligations", "y_pred_gfsm_obligations", "gfsm_obligation_score"),
                                  ("phi", "y_pred_phi", "phi_score"),
                                  ("stl", "y_pred_stl", "stl_score"),
-                                 ("combined", "y_pred", "combined_score")):
+                                 ("combined", "y_pred", "combined_score"),
+                                 ("combined_obligations", "y_pred_combined_obligations", "combined_obligations_score")):
             arms[arm] = detection_metrics(frame[truth], frame[flag], frame[score])
         result[scope] = arms
     classes = {}
@@ -40,9 +43,12 @@ def ablation(topology: str) -> dict:
             arm: detection_metrics(
                 subset["y_true"], subset[flag], subset[score])
             for arm, flag, score in (("gfsm", "y_pred_gfsm", "y_pred_gfsm"),
+                                     ("gfsm_timing", "y_pred_gfsm_timing", "y_pred_gfsm_timing"),
+                                     ("gfsm_obligations", "y_pred_gfsm_obligations", "gfsm_obligation_score"),
                                      ("phi", "y_pred_phi", "phi_score"),
                                      ("stl", "y_pred_stl", "stl_score"),
-                                     ("combined", "y_pred", "combined_score"))
+                                     ("combined", "y_pred", "combined_score"),
+                                     ("combined_obligations", "y_pred_combined_obligations", "combined_obligations_score"))
         }
     result["per_attack_class"] = classes
     result["prediction_file"] = str(path)
@@ -52,8 +58,12 @@ def ablation(topology: str) -> dict:
 
 def baselines(topology: str) -> dict:
     result = {}
-    for name in ("cusum", "sain", "sain_local", "sicams", "imdisco", "hybrid", "conv"):
-        path = ROOT / f"scripts/out/full_signal_{name}/{topology}/metrics.json"
+    for name in ("cusum", "sain", "sain_local", "sicams", "imdisco", "imdisco_maximal", "hybrid", "conv"):
+        method_root = {
+            "sain_local": "full_signal_sain_local_quantminer",
+            "imdisco_maximal": "full_signal_imdisco_maximal",
+        }.get(name, f"full_signal_{name}")
+        path = ROOT / f"scripts/out/{method_root}/{topology}/metrics.json"
         result[name] = load(path) or {"status": "pending", "path": str(path)}
     return result
 

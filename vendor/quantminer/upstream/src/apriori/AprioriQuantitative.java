@@ -16,6 +16,7 @@ package src.apriori;
 
 import java.sql.*;
 import java.util.*;
+import java.math.BigInteger;
 import java.util.*;
 
 import src.database.*;
@@ -189,14 +190,15 @@ public class AprioriQuantitative {
      * @param iNombreItems Number of items
      * @param iNombrePlaces Number of places
      */
-    public static boolean [] CalculerEnsemblesItems(int iIndiceRepartition, int iNombreItems, int iNombrePlaces) {
+    public static boolean [] CalculerEnsemblesItems(long iIndiceRepartition, int iNombreItems, int iNombrePlaces) {
         boolean [] tRepartitionItems = null;
         boolean bItemAffecte = false;        
         int iIndiceItem = 0;
         int iNombreItemsRestants = 0;
         int iNombrePlacesRestantes = 0;
         int iCompteur = 0;
-        int factN = 0, factP = 0, factN_P = 0, iCNP = 0; // Variables d�di�es au calcul des combinaisons de p valeurs parmi n
+        // Exact combinatorics avoid 32-bit factorial overflow on wide inputs.
+        BigInteger factN = BigInteger.ZERO, factP = BigInteger.ZERO, factN_P = BigInteger.ZERO, iCNP = BigInteger.ZERO;
         
         if (iNombreItems==0) return null;
  
@@ -210,30 +212,30 @@ public class AprioriQuantitative {
             
             if (iNombreItemsRestants>iNombrePlacesRestantes) {
 
-                factN = factP = factN_P = 1;
+                factN = factP = factN_P = BigInteger.ONE;
 
                 for (iCompteur=2;iCompteur<iNombreItemsRestants;iCompteur++)
-                    factN *= iCompteur;
+                    factN = factN.multiply(BigInteger.valueOf(iCompteur));
 
                 for (iCompteur=2;iCompteur<iNombrePlacesRestantes;iCompteur++)
-                    factP *= iCompteur;
+                    factP = factP.multiply(BigInteger.valueOf(iCompteur));
 
                 for (iCompteur=2;iCompteur<=(iNombreItemsRestants-iNombrePlacesRestantes);iCompteur++)
-                    factN_P *= iCompteur;
+                    factN_P = factN_P.multiply(BigInteger.valueOf(iCompteur));
 
-                iCNP = factN / (factP * factN_P);
+                iCNP = factN.divide(factP.multiply(factN_P));
 
             }
             // Sinon cas iNombreItemsRestants == iNombrePlacesRestantes :
             else
-                iCNP = 1;
+                iCNP = BigInteger.ONE;
                 
-            if (iIndiceRepartition < iCNP) {
+            if (BigInteger.valueOf(iIndiceRepartition).compareTo(iCNP) < 0) {
                 tRepartitionItems[ iIndiceItem ] = true;
                 iNombrePlacesRestantes--;
             }
             else
-                iIndiceRepartition -= iCNP;
+                iIndiceRepartition -= iCNP.longValue();
                 
             iIndiceItem++;
             iNombreItemsRestants--;

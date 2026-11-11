@@ -40,6 +40,28 @@ def compile_cli(work_dir: Path) -> Path:
     return classes
 
 
+def _source_provenance() -> dict:
+    paths = sorted((VENDOR_ROOT / "upstream/src").rglob("*.java"))
+    paths.append(VENDOR_ROOT / "QuantMinerCli.java")
+    records = [
+        {
+            "path": str(path.relative_to(VENDOR_ROOT)),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+        for path in paths
+    ]
+    tree = hashlib.sha256()
+    for record in records:
+        tree.update(record["path"].encode("utf-8"))
+        tree.update(record["sha256"].encode("ascii"))
+    version = subprocess.run(["java", "-version"], capture_output=True, text=True)
+    return {
+        "files": records,
+        "source_tree_sha256": tree.hexdigest(),
+        "java_version": (version.stderr or version.stdout).strip(),
+    }
+
+
 def run_quantminer(frame: pd.DataFrame, out_dir: Path,
                    config: QuantMinerConfig = QuantMinerConfig()) -> dict:
     out_dir = Path(out_dir)
@@ -60,6 +82,10 @@ def run_quantminer(frame: pd.DataFrame, out_dir: Path,
     provenance = {
         "implementation": "official_vendored_quantminer_java",
         "upstream_commit": "587eea87c3603a2e0ef0e4b032422ffdedf5b645",
+        "pristine_upstream": False,
+        "source_patch_applied": "exact BigInteger combinatorics and 64-bit combination index",
+        "source_provenance": _source_provenance(),
+        "source_provenance_timing": "recorded_by_wrapper_for_this_execution",
         "command": command,
         "config": config.__dict__,
         "input_sha256": hashlib.sha256(input_path.read_bytes()).hexdigest(),

@@ -272,3 +272,5 @@ paper/
 .worktrees/
 !vendor/quantminer/dist/
 !vendor/quantminer/dist/*.jar
+TODO.md
+review/

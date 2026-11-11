@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
-"""Run uncapped IM-DISCO on observable numeric signals only.
+"""Run the exact maximal, thesis-inspired IM-DISCO adaptation.
 
-``--provenance-only`` refreshes config/feature-policy metadata without fitting
-or invoking FP-Growth; existing unavailable status and reason fields are kept.
+Actuator roles come from the topology/GFSM mapping; every other observable
+numeric channel is a sensor.  No features or episodes are trimmed and attack
+labels are used only for post-prediction metrics.  Results are separate from
+the preserved uncapped-unavailable artifacts.
+
+``--provenance-only`` retains its legacy role for the original uncapped output
+root and does not fit or invoke FP-Growth.
 """
 from __future__ import annotations
 
@@ -19,7 +24,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from baselines.imdisco import IMDISCO, IMDISCOConfig, _infer_columns
+from baselines.imdisco import IMDISCO, IMDISCOConfig
 from dataio.full_signal import (
     discover_full_signal_runs,
     load_full_signal_run,
@@ -29,7 +34,8 @@ from dataio.full_signal import (
 from invariants.state_label import label_frame
 from stl.metrics import detection_metrics
 
-OUT_ROOT = REPO_ROOT / "scripts/out/full_signal_imdisco"
+OUT_ROOT = REPO_ROOT / "scripts/out/full_signal_imdisco_maximal"
+UNCAPPED_OUT_ROOT = REPO_ROOT / "scripts/out/full_signal_imdisco"
 EXCLUDED_PREFIXES = ("leak_", "demand_", "emitter_")
 EXCLUDED_COLUMNS = {
     "time_seconds", "timestamp", "attack_active", "attack_class", "label",
@@ -80,13 +86,40 @@ def observable_policy(
         "dropped_non_numeric_columns": dropped_non_numeric,
         "remaining_numeric_feature_count": len(observable.columns),
         "remaining_numeric_features": list(observable.columns),
-        "remaining_feature_counts_after_role_inference": {
+        "role_assignment": (
+            "actuators are exact fb_to_col.values() from the topology/GFSM mapping; "
+            "sensors are every other observable numeric channel; no dtype/cardinality inference"
+        ),
+        "feature_roles": {
+            "sensors": list(sensors),
+            "actuators": list(actuators),
+        },
+        "remaining_feature_counts_by_topology_role": {
             "sensors": len(sensors),
             "actuators": len(actuators),
             "total": len(sensors) + len(actuators),
         },
+        "feature_trimming": False,
+        "episode_trimming": False,
+        "attack_labels_used_as_features_or_modes": False,
         "observable_frame_sha256": frame_sha256(observable),
     }
+
+
+def topology_feature_roles(
+    train: pd.DataFrame,
+    fb_to_col: dict,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Exact topology roles, with no dtype/cardinality inference or trimming."""
+    actuators = tuple(dict.fromkeys(str(column) for column in fb_to_col.values()))
+    missing_actuators = [column for column in actuators if column not in train.columns]
+    if missing_actuators:
+        raise ValueError(f"topology-mapped actuator columns are not observable: {missing_actuators}")
+    actuator_set = set(actuators)
+    sensors = tuple(
+        column for column in train.columns if column != "mode" and column not in actuator_set
+    )
+    return sensors, actuators
 
 
 def _script_sha256(path: Path) -> str:
@@ -122,7 +155,7 @@ def _prepare_training(topology: str, split) -> tuple[pd.DataFrame, dict, dict, d
     source = split.train.frame
     train = observable_frame(source)
     train["mode"] = label_frame(source, components, fb_to_col).to_numpy()
-    sensors, actuators = _infer_columns(train, "mode")
+    sensors, actuators = topology_feature_roles(train, fb_to_col)
     policy = observable_policy(
         source, train.drop(columns=["mode"]), sensors=sensors, actuators=actuators
     )
@@ -142,7 +175,13 @@ def run_topology(topology: str, *, provenance_only: bool = False) -> dict:
     split = split_nominal_run(nominal)
     train, mapping, policy, input_hashes = _prepare_training(topology, split)
     input_hashes = {**nominal.input_hashes, **input_hashes}
-    config = IMDISCOConfig(mode_column="mode")
+    roles = policy["feature_roles"]
+    config = IMDISCOConfig(
+        mode_column="mode",
+        sensor_columns=tuple(roles["sensors"]),
+        actuator_columns=tuple(roles["actuators"]),
+        prune_subsumed_rules=not provenance_only,
+    )
     feature_provenance = {
         "runner_path": "scripts/run_full_signal_imdisco.py",
         "runner_sha256": _script_sha256(Path(__file__)),
@@ -150,12 +189,15 @@ def run_topology(topology: str, *, provenance_only: bool = False) -> dict:
         "input_hashes": input_hashes,
         "mining_invoked_for_feature_policy_computation": False,
         "note": (
-            "Existing status and reason are preserved. Historical reasons may "
-            "predate observable-only correction; current counts are in "
-            "scripts/out/full_signal_imdisco/tractability.json."
+            "Legacy uncapped status/reason is preserved in provenance-only mode. "
+            "Normal execution writes only the separate maximal adaptation artifacts."
         ),
+        "feature_trimming": False,
+        "episode_trimming": False,
+        "attack_labels_used_for_training": False,
     }
-    out_dir = OUT_ROOT / topology
+    out_root = UNCAPPED_OUT_ROOT if provenance_only else OUT_ROOT
+    out_dir = out_root / topology
     out_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = out_dir / "metrics.json"
 
@@ -177,7 +219,8 @@ def run_topology(topology: str, *, provenance_only: bool = False) -> dict:
         detector = IMDISCO(config).fit(train)
     except Exception as exc:
         result = {
-            "schema": "full-signal-imdisco/v1",
+            "schema": "full-signal-imdisco-maximal/v1",
+            "adaptation": "thesis-inspired exact maximal closed-pattern rules; not official code reproduction",
             "topology": topology,
             "status": "unavailable",
             "reason": f"{type(exc).__name__}: {exc}",
@@ -206,13 +249,23 @@ def run_topology(topology: str, *, provenance_only: bool = False) -> dict:
         }))
     pd.concat(rows, ignore_index=True).to_csv(out_dir / "predictions.csv", index=False)
     result = {
-        "schema": "full-signal-imdisco/v1", "topology": topology,
+        "schema": "full-signal-imdisco-maximal/v1",
+        "adaptation": "thesis-inspired exact maximal closed-pattern rules; not official code reproduction",
+        "topology": topology,
         "status": "ok", "metrics": metrics, "mapping": mapping,
         "config": config.to_dict(),
         "observable_policy": policy,
         "feature_policy_provenance": feature_provenance,
-        "nominal_split": split.manifest, "model": detector.provenance(),
+        "nominal_split": split.manifest,
+        "model": detector.provenance(),
+        "mining": detector.artifacts()["mining"],
+        "mode_count": int(train["mode"].nunique()),
+        "evaluation_runs": [split.test.name, *[run.name for run in discovery.attacks]],
+        "evaluation_episode_trimming": False,
     }
+    (out_dir / "model.json").write_text(
+        json.dumps(detector.artifacts(), indent=2, sort_keys=True, default=str) + "\n"
+    )
     metrics_path.write_text(json.dumps(result, indent=2, sort_keys=True, default=str) + "\n")
     return result
 
@@ -227,7 +280,8 @@ def main() -> int:
     args = parser.parse_args()
     result = run_topology(args.topology, provenance_only=args.provenance_only)
     suffix = " (provenance only; no mining)" if args.provenance_only else ""
-    print(f"{args.topology}: {result['status']}{suffix} -> {OUT_ROOT / args.topology}")
+    root = UNCAPPED_OUT_ROOT if args.provenance_only else OUT_ROOT
+    print(f"{args.topology}: {result['status']}{suffix} -> {root / args.topology}")
     return 0
 
 

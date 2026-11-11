@@ -15,6 +15,7 @@ import pandas as pd
 import sklearn
 
 from invariants.full_signal_phi import FullSignalPhiDetector
+from monitor.gfsm_obligations import GfsmObligationDetector
 
 try:
     from scripts import export_topology_predictions as export
@@ -152,6 +153,14 @@ def prepare(topology, full_root, data_root, out_root, *, nominal_dir=None,
         components=components, frame_columns=list(nominal_frame.columns),
     )
     gfsm = export.GfsmAnomalyDetector(gfsm_dir=gfsm_dir, topology=topology, fb_to_col=mapping).fit([])
+    timing = GfsmObligationDetector(
+        gfsm_dir=gfsm_dir, topology=topology, fb_to_col=mapping,
+        check_obligations=False,
+    ).fit([])
+    obligations = GfsmObligationDetector(
+        gfsm_dir=gfsm_dir, topology=topology, fb_to_col=mapping,
+        check_obligations=True,
+    ).fit([])
     phi_calibration = nominal_frame.iloc[:n_cal].copy()
     phi_train_end = int(len(nominal_frame) * PHI_TRAIN_FRACTION)
     phi = FullSignalPhiDetector.fit(
@@ -162,15 +171,25 @@ def prepare(topology, full_root, data_root, out_root, *, nominal_dir=None,
         fb_to_col=mapping,
     )
     evaluated = {}
+    timing_evaluated = {}
+    obligation_evaluated = {}
+    obligation_reasons = {}
     for name, (frame, truth) in scenarios.items():
         if name == nominal:
             frame = frame.iloc[n_cal:].reset_index(drop=True)
             truth = truth[n_cal:]
         flags = np.asarray(gfsm.predict(frame).flags, dtype=int)
         evaluated[name] = (frame, truth, flags)
+        timing_evaluated[name] = np.asarray(timing.predict(frame).flags, dtype=int)
+        obligation = obligations.predict_detailed(frame)
+        obligation_evaluated[name] = np.asarray(obligation.flags, dtype=int)
+        obligation_reasons[name] = obligation.reasons
     return {
         "network": export.load_network(inp), "calibration": nominal_frame.iloc[:n_cal].copy(),
         "scenarios": evaluated, "label_frames": label_frames,
+        "timing_evaluated": timing_evaluated,
+        "obligation_evaluated": obligation_evaluated,
+        "obligation_reasons": obligation_reasons,
         "nominal": nominal, "mapping": mapping_report,
         "components": components, "fb_to_col": mapping, "phi": phi,
         "inputs": {str(p): _hash(p) for p in sorted(inputs)},
@@ -191,16 +210,27 @@ def evaluate(prepared, percentile, scale):
         phi = np.asarray(phi_result.flags, dtype=int)
         phi_score = np.asarray(phi_result.scores, dtype=float)
         combined = np.logical_or.reduce((stl, gfsm, phi)).astype(int)
+        timing = prepared["timing_evaluated"][name]
+        obligation = prepared["obligation_evaluated"][name]
+        combined_obligations = np.logical_or.reduce((stl, obligation, phi)).astype(int)
         frames.append(pd.DataFrame({
             "scenario": name, "y_true": truth, "gfsm": gfsm, "stl": stl,
             "phi": phi, "phi_score": phi_score,
+            "gfsm_timing": timing,
+            "gfsm_obligations": obligation,
+            "gfsm_obligation_score": obligation.astype(float),
             "stl_score": stl_score,
             "combined": combined,
             "combined_score": np.maximum.reduce((stl_score, gfsm, phi_score)),
+            "combined_obligations": combined_obligations,
+            "combined_obligations_score": np.maximum.reduce(
+                (stl_score, obligation.astype(float), phi_score)
+            ),
             "unknown": unknown,
         }))
     artifact = detector.to_artifact()
     artifact["phi"] = prepared["phi"].model
+    artifact["gfsm_obligation_reasons"] = prepared["obligation_reasons"]
     return pd.concat(frames, ignore_index=True), artifact
 
 
@@ -208,9 +238,17 @@ def metrics(frame, nominal_mask):
     result = {"rows": len(frame), "attack_rows": int(frame.y_true.sum()),
               "unknown_rows": int((frame.unknown > 0).sum()),
               "unknown_residuals": int(frame.unknown.sum())}
-    for arm in ("gfsm", "phi", "stl", "combined"):
-        scores = frame[arm] if arm == "gfsm" else frame[f"{arm}_score"]
-        values = export.detection_metrics(frame.y_true, frame[arm], scores)
+    score_columns = {
+        "gfsm": "gfsm",
+        "gfsm_timing": "gfsm_timing",
+        "gfsm_obligations": "gfsm_obligation_score",
+        "phi": "phi_score",
+        "stl": "stl_score",
+        "combined": "combined_score",
+        "combined_obligations": "combined_obligations_score",
+    }
+    for arm, score_column in score_columns.items():
+        values = export.detection_metrics(frame.y_true, frame[arm], frame[score_column])
         result[arm] = {"mcc": values["mcc"], "balanced_accuracy": values["balanced_accuracy"],
                        "auprc": values["aucpr"],
                        "nominal_false_alarms": int(((frame[arm] == 1) & (frame.y_true == 0) & nominal_mask).sum())}
@@ -242,12 +280,13 @@ def main(argv=None):
         "base_additive": export.DEFAULT_ADDITIVE, "calibration_fraction": export.DEFAULT_CALIBRATION_FRACTION,
         "unknown_policy": export.DEFAULT_UNKNOWN_POLICY, "closed_flow_epsilon_m3_per_s": CLOSED_FLOW_EPSILON,
         "closed_flow_rule": "calibrated closed tolerance is max(percentile + scaled additive, fixed floor); unseen closed regime uses fixed floor",
-        "aggregation": "pooled rows; independent scenario predictions", "scores": "STL violated residual count; combined max(STL score, GFSM flag, Phi flag); Phi is global NiaARM"},
+        "aggregation": "pooled rows; independent scenario predictions", "scores": "STL violated residual count; original and obligation-aware fused maxima; Phi is global NiaARM; obligations use previous-input guards"},
         "software": {"python": platform.python_version(), "numpy": np.__version__,
                      "pandas": pd.__version__, "scikit_learn": sklearn.__version__},
         "code_sha256": {str(p): _hash(p) for p in (
             Path(__file__), Path(export.__file__), export.REPO_ROOT / "src/stl/topology_detector.py",
-            export.REPO_ROOT / "src/stl/metrics.py", export.REPO_ROOT / "src/monitor/gfsm_detector.py", export.REPO_ROOT / "src/invariants/full_signal_phi.py")},
+            export.REPO_ROOT / "src/stl/metrics.py", export.REPO_ROOT / "src/monitor/gfsm_detector.py", export.REPO_ROOT / "src/invariants/full_signal_phi.py",
+             export.REPO_ROOT / "src/monitor/gfsm_obligations.py")},
         "inputs": {name: data["inputs"] for name, data in prepared.items()},
         "gfsm_mapping": {name: data["mapping"] for name, data in prepared.items()}, "configurations": []}
     csv_rows = []
@@ -270,7 +309,10 @@ def main(argv=None):
         summary["configurations"].append(config)
         for topology, item in [("ALL", {"aggregate": config["aggregate"], "scenarios": {}}), *config["topologies"].items()]:
             for scenario, result in [("ALL", item["aggregate"]), *item["scenarios"].items()]:
-                for arm in ("gfsm", "phi", "stl", "combined"):
+                for arm in (
+                    "gfsm", "gfsm_timing", "gfsm_obligations", "phi", "stl",
+                    "combined", "combined_obligations",
+                ):
                     csv_rows.append({"topology": topology, "scenario": scenario, "percentile": percentile,
                                      "additive_scale": scale, "arm": arm,
                                      **{k: result[k] for k in ("rows", "attack_rows", "unknown_rows", "unknown_residuals")}, **result[arm]})

@@ -1,8 +1,8 @@
 """Tests for the IM-DISCO predicate/runtime baseline.
 
-Mining tests use a tiny spy in place of mlxtend so the pipeline is exercised
-even when mlxtend is not installed.  The spy is test scaffolding only; the
-production module refuses to run without the real mlxtend miner.
+Uncapped mining tests use a tiny spy in place of mlxtend so that arm is
+exercised even when mlxtend is not installed.  The exact maximal arm has no
+mlxtend dependency; parity tests use the real package when available.
 """
 
 from __future__ import annotations
@@ -38,7 +38,12 @@ def train_frame() -> pd.DataFrame:
 
 
 def config(**overrides) -> imdisco.IMDISCOConfig:
-    base = dict(sensor_columns=SENSORS, actuator_columns=ACTUATORS)
+    # Most legacy pipeline tests spy on the explicitly uncapped mlxtend arm.
+    base = dict(
+        sensor_columns=SENSORS,
+        actuator_columns=ACTUATORS,
+        prune_subsumed_rules=False,
+    )
     base.update(overrides)
     return imdisco.IMDISCOConfig(**base)
 
@@ -154,18 +159,39 @@ def test_sensor_minmax_bounds_are_per_mode_and_inclusive():
     )
 
 
-def test_gradient_bounds_use_first_difference_with_zero_first_row():
+def test_gradient_excludes_mode_entries_and_transition_is_entry_only():
     frame = train_frame()
     predicates = imdisco.derive_predicates(
         frame, frame["mode"], SENSORS, ACTUATORS
     )
     riding = one_predicate(predicates, "gradient", "velocity", "riding")
-    onstation = one_predicate(predicates, "gradient", "velocity", "onstation")
 
-    # velocity diffs: [0, 2, -12, 1, 19, 2]
-    assert (riding.lo, riding.hi) == (0.0, 19.0)
-    assert (onstation.lo, onstation.hi) == (-12.0, 1.0)
-    assert riding.lo == 0.0
+    # Velocity diffs are [0, 2, -12, 1, 19, 2].  Rows 1, 3 and 5
+    # are within-mode; rows 2 and 4 are transitions and row 0 starts the frame.
+    assert (riding.lo, riding.hi) == (2.0, 2.0)
+    onstation = one_predicate(predicates, "gradient", "velocity", "onstation")
+    assert (onstation.lo, onstation.hi) == (1.0, 1.0)
+    transitions = [p for p in predicates if p.kind == "transitiongradient"]
+    assert {(p.mode, p.previous_mode) for p in transitions} == {
+        ("onstation", "riding"), ("riding", "onstation")
+    }
+    arriving = next(
+        p for p in transitions if p.mode == "onstation" and p.variable == "velocity"
+    )
+    assert (arriving.lo, arriving.hi) == (-12.0, -12.0)
+
+    gradient = imdisco._gradient_frame(frame, ("velocity", "accel"))
+    runs = {"door": imdisco._run_lengths(frame["door"])}
+    transactions, _ = imdisco._transactions(
+        frame,
+        frame["mode"].to_numpy(),
+        [imdisco._value_key(v) for v in frame["mode"]],
+        predicates,
+        gradient,
+        runs,
+    )
+    # The onstation TransitionGradient item occurs only at row 2, not row 3.
+    assert transactions[arriving.item].tolist() == [False, False, True, False, False, False]
 
 
 def test_steadytime_bounds_use_consecutive_runs_per_state():
@@ -179,7 +205,9 @@ def test_steadytime_bounds_use_consecutive_runs_per_state():
     predicates = imdisco.derive_predicates(
         frame, frame["mode"], ("velocity",), ("door",)
     )
-    # runs are [1, 2, 3, 1, 2, 1]
+    # Completed totals are retrospective on every run row; final ON is ongoing.
+    assert np.isnan(imdisco._run_lengths(frame["door"])[-1])
+    assert imdisco._run_lengths(frame["door"])[:5].tolist() == [3, 3, 3, 2, 2]
     on_m1 = [
         p
         for p in predicates
@@ -196,19 +224,42 @@ def test_steadytime_bounds_use_consecutive_runs_per_state():
         if p.kind == "steadytime" and p.mode == "m2" and p.state_key == "str:ON"
     ]
 
-    assert (on_m1[0].lo, on_m1[0].hi) == (1.0, 3.0)
-    assert (off_m2[0].lo, off_m2[0].hi) == (1.0, 2.0)
-    assert (on_m2[0].lo, on_m2[0].hi) == (1.0, 1.0)
+    assert (on_m1[0].lo, on_m1[0].hi) == (3.0, 3.0)
+    assert (off_m2[0].lo, off_m2[0].hi) == (2.0, 2.0)
+    assert on_m2 == []
 
     assert on_m1[0].evaluate(
-        values={"door": "ON"}, gradients={}, run_lengths={"door": 2.0}
+        values={"door": "ON"}, gradients={}, run_lengths={"door": 3.0}
     )
     assert not on_m1[0].evaluate(
-        values={"door": "ON"}, gradients={}, run_lengths={"door": 4.0}
+        values={"door": "ON"}, gradients={}, run_lengths={"door": 2.0}
     )
     assert not on_m1[0].evaluate(
         values={"door": "OFF"}, gradients={}, run_lengths={"door": 2.0}
     )
+
+
+def test_steadytime_excludes_mode_crossing_run_with_provenance():
+    frame = pd.DataFrame({
+        "door": ["ON", "ON", "ON", "OFF"],
+        "mode": ["m1", "m2", "m2", "m2"],
+    })
+    predicates = imdisco.derive_predicates(frame, frame["mode"], (), ("door",))
+    assert not [p for p in predicates if p.kind == "steadytime"]
+    durations, records = imdisco._completed_run_records(
+        frame["door"], [imdisco._value_key(v) for v in frame["mode"]]
+    )
+    assert np.isnan(durations).all()
+    assert records[0]["exclusion_reason"] == "crosses_mode_boundary"
+    assert records[1]["exclusion_reason"] == "final_ongoing_run"
+
+    report = imdisco._steadytime_provenance(
+        frame, ("door",), [imdisco._value_key(v) for v in frame["mode"]]
+    )
+    actuator = report["actuators"]["door"]
+    assert actuator["excluded_mode_crossing_runs"] == 1
+    assert actuator["excluded_final_ongoing_runs"] == 1
+    assert report["causal"] is False
 
 
 def test_strict_bounds_option_restores_printed_formulas():
@@ -232,7 +283,7 @@ def test_bounds_artifact_is_sorted_and_json_safe():
     )
     bounds = imdisco.bounds_artifact(predicates)
     assert bounds["minmax"]["riding"]["velocity"]["lo"] == 10.0
-    assert bounds["actuator_states"]["riding"]["door"] == ["str:closed"]
+    assert bounds["actuator_states"]["*"]["door"] == ["str:closed", "str:open"]
     json.dumps(bounds)
 
 
@@ -270,7 +321,7 @@ def test_invalid_thresholds_are_rejected():
 def test_default_has_no_itemset_length_cap():
     cfg = imdisco.IMDISCOConfig()
     assert cfg.max_itemset_len is None
-    assert cfg.prune_subsumed_rules is False
+    assert cfg.prune_subsumed_rules is True
 
 
 def test_tractability_limit_fails_explicitly(monkeypatch):
@@ -347,7 +398,11 @@ def test_unmatched_and_out_of_training_rows_are_anomalous(monkeypatch):
         {
             "riding": [
                 one_predicate(predicates, "minmax", "velocity", "riding"),
-                one_predicate(predicates, "state", "door", "riding"),
+                next(
+                    p for p in predicates
+                    if p.kind == "state" and p.variable == "door"
+                    and p.state_key == "str:closed"
+                ),
             ]
         },
     )
@@ -533,7 +588,8 @@ def test_rules_use_mode_consequent_and_subsumed_antecedents_are_pruned(monkeypat
 
     by_mode = {}
     for predicate in first.predicates:
-        by_mode.setdefault(predicate.mode_key, []).append(predicate.item)
+        if predicate.mode_key is not None:
+            by_mode.setdefault(predicate.mode_key, []).append(predicate.item)
 
     rows = []
     for mode_key, items in by_mode.items():
@@ -571,13 +627,108 @@ def test_rules_use_mode_consequent_and_subsumed_antecedents_are_pruned(monkeypat
 
     fake = FakeMiner(rules=pd.DataFrame(rows))
     install_fake(monkeypatch, fake)
-    model = imdisco.IMDISCO(
-        config(prune_subsumed_rules=True)
-    ).fit(frame, frame["mode"])
+    model = imdisco.IMDISCO(config()).fit(frame, frame["mode"])
+    pruned = imdisco._prune_subsumed(model.rules)
 
-    # One maximal antecedent per mode remains after the explicitly enabled
-    # subsumption pruning; the paper does not specify this extra step, so it
-    # is off by default.
-    assert len(model.rules) == len(by_mode)
-    assert {rule.mode for rule in model.rules} == {"onstation", "riding"}
-    assert all(rule.mode_key in by_mode for rule in model.rules)
+    # One synthetic maximal antecedent per mode remains after post-ARG pruning.
+    assert len(pruned) == len(by_mode)
+    assert {rule.mode for rule in pruned} == {"onstation", "riding"}
+    assert all(rule.mode_key in by_mode for rule in pruned)
+
+
+# ---------------------------------------------------------------------------
+# Exact maximal adaptation and corrected item semantics
+
+
+@pytest.mark.parametrize("minconf", [1.0, 0.5])
+def test_maximal_closed_rules_parity_with_uncapped_mlxtend(minconf):
+    pytest.importorskip("mlxtend")
+    frame = pd.DataFrame({
+        "x": [1.0, 2.0, 4.0, 5.0, 7.0, 8.0],
+        "door": [1, 0, 1, 0, 1, 0],
+        "mode": ["a", "a", "b", "b", "c", "c"],
+    })
+    common = dict(
+        sensor_columns=("x",), actuator_columns=("door",),
+        mode_column="mode", minconf=minconf, max_frequent_itemsets=None,
+    )
+    uncapped = imdisco.IMDISCO(
+        imdisco.IMDISCOConfig(**common, prune_subsumed_rules=False)
+    ).fit(frame)
+    maximal = imdisco.IMDISCO(
+        imdisco.IMDISCOConfig(**common, prune_subsumed_rules=True)
+    ).fit(frame)
+    expected = imdisco._prune_subsumed(uncapped.rules)
+
+    assert {rule.rule_id for rule in maximal.rules} == {rule.rule_id for rule in expected}
+    expected_by_id = {rule.rule_id: rule for rule in expected}
+    for rule in maximal.rules:
+        other = expected_by_id[rule.rule_id]
+        assert rule.support == pytest.approx(other.support)
+        assert rule.confidence == pytest.approx(other.confidence)
+        assert rule.lift == pytest.approx(other.lift)
+    assert maximal._mining["n_frequent_itemsets"] == uncapped._mining["n_frequent_itemsets"]
+    assert maximal._mining["n_rules_before_pruning"] is None
+    assert maximal._mining["n_qualified_closed_rules"] >= len(maximal.rules)
+
+
+def test_shared_state_items_have_cross_mode_confidence():
+    pytest.importorskip("mlxtend")
+    frame = pd.DataFrame({
+        "door": [1, 0, 1, 0],
+        "mode": ["a", "a", "b", "b"],
+    })
+    cfg = imdisco.IMDISCOConfig(
+        sensor_columns=(), actuator_columns=("door",), mode_column="mode",
+        minconf=0.5, max_frequent_itemsets=None, prune_subsumed_rules=False,
+    )
+    model = imdisco.IMDISCO(cfg).fit(frame)
+    state_predicates = [p for p in model.predicates if p.kind == "state"]
+    assert len(state_predicates) == 2
+    assert all(p.mode_key is None for p in state_predicates)
+    on_item = next(p.item for p in state_predicates if p.state_key == "int:1")
+    rule = next(
+        rule for rule in model.rules
+        if rule.mode == "a" and rule.antecedent_items == (on_item,)
+    )
+    # Shared ON occurs twice overall and once in mode a.
+    assert rule.support == pytest.approx(0.25)
+    assert rule.confidence == pytest.approx(0.5)
+    assert rule.lift == pytest.approx(1.0)
+
+
+def test_huge_dense_maximal_fit_never_invokes_fpgrowth(monkeypatch):
+    def fail_if_loaded():
+        raise AssertionError("maximal adaptation must not load or invoke mlxtend")
+
+    monkeypatch.setattr(imdisco, "_load_mlxtend", fail_if_loaded)
+    rows = 8
+    width = 40
+    frame = pd.DataFrame({
+        **{f"s{index}": [float(index)] * rows for index in range(width)},
+        "mode": ["m"] * rows,
+    })
+    model = imdisco.IMDISCO(imdisco.IMDISCOConfig(
+        sensor_columns=tuple(f"s{index}" for index in range(width)),
+        actuator_columns=(), mode_column="mode",
+    )).fit(frame)
+    assert len(model.rules) == 1
+    assert model._mining["n_frequent_itemsets"] > 2_000_000
+    assert model._mining["frequent_itemsets_materialized"] is False
+
+
+def test_prediction_assigns_completed_total_to_all_run_rows(monkeypatch):
+    model, _ = fit_model(monkeypatch)
+    steady = imdisco.Predicate(
+        kind="steadytime", variable="door", mode="riding",
+        mode_key=imdisco._value_key("riding"), state_key="str:closed",
+        lo=2.0, hi=2.0, n=1,
+    )
+    inject_rules(model, {"riding": [steady]})
+    result = model.predict(pd.DataFrame({
+        "velocity": [11.0, 11.0, 11.0],
+        "accel": [1.5, 1.5, 1.5],
+        "door": ["closed", "closed", "open"],
+    }))
+    assert result.predicted_modes == ("riding", "riding", None)
+    assert result.anomaly_flags.tolist() == [0, 0, 1]

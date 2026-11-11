@@ -22,3 +22,4 @@ class AnalyzeResult:
     state_variable: str | None = None
     ok: bool = True
     errors: list[str] = field(default_factory=list)
+    pdg_components: list[dict[str, Any]] = field(default_factory=list)

@@ -55,7 +55,7 @@ public class RuleTester extends Thread { //test rules
     private int m_iMaximumItemsQuantConsideres = 0; //maximum # of quantitative attributes in a rule
     int m_iTailleFrequent = 0;                      //size of a frequent item set
     int m_iIndiceFrequent = 0;
-    int m_iIndiceCombinaisonItemsQuant = 0;
+    long m_iIndiceCombinaisonItemsQuant = 0;
     int m_iIndiceRepartitionItems = 0;
     public boolean m_bFinTestRegles = false;
     public int m_iNombreReglesTestees = 0; // Compteur du nombre de regles deja testees par l'algorithme -- count the number of rules already tested by the algorithm 

@@ -1,40 +1,41 @@
-"""IM-DISCO invariant-rule baseline (Saraiva, Apolinario & Pardal).
+"""Thesis-inspired IM-DISCO invariant-rule baseline.
 
-This module is a from-scratch implementation of the full IM-DISCO paper
-(``imdisco-paper.pdf``), not of the aggregate results tables.  The pipeline is:
+The implementation follows Saraiva's IM-DISCO paper and 2023 thesis where
+their behaviour is explicit, and records every adaptation in
+:meth:`IMDISCO.provenance`.  The pipeline is:
 
-1. **Predicate generation** per expert-supplied operational mode:
-   * sensor ``MinMax`` bounds (``min(V_m) <= x <= max(V_m)``),
-   * first-gradient bounds (``diff(x)``, first row defined as ``0.0``),
-   * actuator state predicates, and
-   * actuator ``SteadyTime`` bounds over consecutive runs of one state.
-2. **Invariant rule mining**: one transaction per timestep containing the
-   predicates of that timestep's expert mode plus the mode item; FP-Growth
-   (``minsup=0.05``) and mlxtend association rules (``minconf=1.0``) with the
-   mode as consequent.
+1. **Predicate generation** from expert-supplied operational modes: mode-local
+   sensor MinMax, ordinary Gradient, entry-only TransitionGradient and
+   SteadyTime predicates, plus actuator State items shared across modes.
+2. **Invariant rule mining**: one transaction per timestep plus a separate
+   mode item.  The default is an exact maximal-rule adaptation using frequent
+   closed transaction patterns and subsumption pruning.  Setting
+   ``prune_subsumed_rules=False`` instead materializes uncapped mlxtend
+   FP-Growth itemsets and association rules (``minsup=0.05``, ``minconf=1.0``).
 3. **Runtime inference**: evaluate rules in a documented deterministic order
-   and take the first matching mode.  No rule matches (including behaviour
-   outside the training bounds) -> anomaly.
+   and take the first matching mode.  No rule matches -> anomaly.
 
-The paper's formulas print strict inequalities, while its own example rules
-(Section 5.3) use ``<=``.  This implementation defaults to inclusive bounds;
-``IMDISCOConfig.inclusive_bounds=False`` restores strictly printed formulas.
+The thesis reports redundancy removal after association-rule generation, and
+the paper reports one maximal conjunction per mode, but neither supplies the
+reduction algorithm or complete code.  The exact closed-pattern path is
+therefore an adaptation, not an official-code reproduction.  It computes the
+same retained rules as uncapped FP-Growth followed by :func:`_prune_subsumed`
+without materializing the potentially exponential intermediate rule set.
 
-The original paper does **not** publish code, rule files, the training ride
-data, or its rule ordering.  Those gaps are recorded in
-:meth:`IMDISCO.provenance` rather than guessed silently.
-
-``mlxtend`` is required for rule mining.  If it is absent, ``fit`` raises
-:class:`MissingMinerError`; no alternate miner is bundled.
+The paper's formulas print strict inequalities, while its examples use ``<=``.
+Inclusive bounds are the default; ``inclusive_bounds=False`` restores the
+strictly printed formulas.  ``mlxtend`` is required only by the uncapped arm.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import itertools
 import json
 import math
 import warnings
-from dataclasses import dataclass, field
+from collections import Counter
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -55,7 +56,7 @@ __all__ = [
     "derive_predicates",
 ]
 
-SCHEMA_VERSION = "imdisco-baseline-v1"
+SCHEMA_VERSION = "imdisco-baseline-v2"
 MODE_ITEM_PREFIX = "mode:"
 
 
@@ -131,13 +132,14 @@ def _mode_sort_key(value: Any) -> tuple[str, str]:
 def _predicate_item(
     kind: str,
     variable: str,
-    mode_key: str,
+    mode_key: str | None,
     lo: float | None,
     hi: float | None,
     state_key: str | None,
+    previous_mode_key: str | None = None,
 ) -> str:
     return json.dumps(
-        [kind, variable, mode_key, lo, hi, state_key],
+        [kind, variable, mode_key, lo, hi, state_key, previous_mode_key],
         separators=(",", ":"),
         ensure_ascii=True,
     )
@@ -162,12 +164,11 @@ class IMDISCOConfig:
     attack-label column (``label``) and ``mode_column`` are never used as
     features.
 
-    ``max_itemset_len`` defaults to ``None``: Section 4 of the paper specifies
-    all frequent itemsets with ``minsup=0.05`` and no maximum length.  An
-    explicit integer imposes a caller-chosen cap; that cap is forwarded to
-    FP-Growth, never replaced by a different miner or a silent length limit.
-    ``max_frequent_itemsets`` is the explicit tractability guard: exceeding it
-    raises :class:`MiningTooLargeError` instead of substituting another method.
+    ``max_itemset_len`` defaults to ``None``.  It is forwarded to FP-Growth
+    only in the uncapped arm (``prune_subsumed_rules=False``).  The exact
+    maximal-rule arm rejects a length cap rather than silently narrowing the
+    rule family.  ``max_frequent_itemsets`` is a tractability guard for the
+    uncapped arm only; the maximal arm never materializes that itemset family.
     """
 
     sensor_columns: tuple[str, ...] | None = None
@@ -177,7 +178,7 @@ class IMDISCOConfig:
     minconf: float = 1.0
     inclusive_bounds: bool = True
     max_itemset_len: int | None = None
-    prune_subsumed_rules: bool = False
+    prune_subsumed_rules: bool = True
     mode_order: tuple[Any, ...] | None = None
     max_frequent_itemsets: int | None = 2_000_000
 
@@ -216,22 +217,35 @@ class IMDISCOConfig:
 
 @dataclass(frozen=True)
 class Predicate:
-    """A mode-scoped sensor/actuator predicate."""
+    """A sensor/actuator predicate.
+
+    State predicates have ``mode_key=None`` and are shared across modes.  All
+    other predicates are mode-local.  TransitionGradient additionally records
+    the previous mode and is valid only at that mode boundary.
+    """
 
     kind: str
     variable: str
     mode: Any
-    mode_key: str
+    mode_key: str | None
     lo: float | None = None
     hi: float | None = None
     state_key: str | None = None
     n: int = 0
     inclusive: bool = True
+    previous_mode: Any = None
+    previous_mode_key: str | None = None
 
     @property
     def item(self) -> str:
         return _predicate_item(
-            self.kind, self.variable, self.mode_key, self.lo, self.hi, self.state_key
+            self.kind,
+            self.variable,
+            self.mode_key,
+            self.lo,
+            self.hi,
+            self.state_key,
+            self.previous_mode_key,
         )
 
     def evaluate(
@@ -240,8 +254,21 @@ class Predicate:
         values: Mapping[str, Any],
         gradients: Mapping[str, Any],
         run_lengths: Mapping[str, Any],
+        previous_mode_key: str | None = None,
+        frame_start: bool = False,
     ) -> bool:
-        if self.kind in ("minmax", "gradient"):
+        if self.kind in ("minmax", "gradient", "transitiongradient"):
+            if self.kind == "gradient" and (
+                frame_start
+                or (previous_mode_key is not None and previous_mode_key != self.mode_key)
+            ):
+                return False
+            if self.kind == "transitiongradient" and (
+                frame_start
+                or previous_mode_key != self.previous_mode_key
+                or previous_mode_key == self.mode_key
+            ):
+                return False
             raw = values.get(self.variable) if self.kind == "minmax" else gradients.get(self.variable)
             try:
                 number = float(raw)
@@ -282,6 +309,8 @@ class Predicate:
             "state": self.state_key,
             "n": int(self.n),
             "inclusive": bool(self.inclusive),
+            "previous_mode": _jsonable(self.previous_mode),
+            "previous_mode_key": self.previous_mode_key,
             "item": self.item,
         }
         return out
@@ -316,9 +345,17 @@ class InvariantRule:
         values: Mapping[str, Any],
         gradients: Mapping[str, Any],
         run_lengths: Mapping[str, Any],
+        previous_mode_key: str | None = None,
+        frame_start: bool = False,
     ) -> bool:
         return all(
-            p.evaluate(values=values, gradients=gradients, run_lengths=run_lengths)
+            p.evaluate(
+                values=values,
+                gradients=gradients,
+                run_lengths=run_lengths,
+                previous_mode_key=previous_mode_key,
+                frame_start=frame_start,
+            )
             for p in self.antecedent
         )
 
@@ -475,24 +512,112 @@ def _gradient_frame(frame: pd.DataFrame, sensor_columns: Sequence[str]) -> pd.Da
     return gradient.astype(float)
 
 
-def _run_lengths(values: Iterable[Any]) -> np.ndarray:
+def _completed_run_records(
+    values: Iterable[Any],
+    mode_keys: Sequence[str] | None = None,
+) -> tuple[np.ndarray, list[dict[str, Any]]]:
+    """Return total durations for completed runs and their explicit provenance.
+
+    A completed run's total duration is assigned retrospectively to every row
+    of that run, following the thesis examples.  The final ongoing run has no
+    completed duration.  During training, a run spanning multiple expert modes
+    is excluded from both duration learning and training transactions.
+    """
     values = list(values)
-    out = np.zeros(len(values), dtype=float)
-    previous: str | None = None
-    run = 0
-    for i, value in enumerate(values):
-        current = _value_key(value)
-        if current is None:
-            run = 0
-            out[i] = 0.0
-        elif previous == current:
-            run += 1
-            out[i] = float(run)
-        else:
-            run = 1
-            out[i] = 1.0
-        previous = current
-    return out
+    if mode_keys is not None and len(mode_keys) != len(values):
+        raise ValueError("mode_keys must match actuator values")
+    durations = np.full(len(values), np.nan, dtype=float)
+    records: list[dict[str, Any]] = []
+    start = 0
+    while start < len(values):
+        state_key = _value_key(values[start])
+        end = start + 1
+        while end < len(values) and _value_key(values[end]) == state_key:
+            end += 1
+        if state_key is not None:
+            completed = end < len(values)
+            run_modes = (
+                sorted(set(mode_keys[start:end])) if mode_keys is not None else []
+            )
+            crosses_modes = len(run_modes) > 1
+            eligible = completed and not crosses_modes
+            exclusion_reason = None
+            if not completed:
+                exclusion_reason = "final_ongoing_run"
+            elif crosses_modes:
+                exclusion_reason = "crosses_mode_boundary"
+            if eligible:
+                durations[start:end] = float(end - start)
+            records.append({
+                "start_row": int(start),
+                "end_row": int(end - 1),
+                "state_key": state_key,
+                "duration": int(end - start),
+                "completed": bool(completed),
+                "mode_keys": run_modes,
+                "crosses_mode_boundary": bool(crosses_modes),
+                "eligible_for_training": bool(eligible),
+                "exclusion_reason": exclusion_reason,
+            })
+        start = end
+    return durations, records
+
+
+def _run_lengths(values: Iterable[Any]) -> np.ndarray:
+    """Completed-run total durations, NaN on the final ongoing/missing runs."""
+    durations, _ = _completed_run_records(values)
+    return durations
+
+
+def _steadytime_provenance(
+    frame: pd.DataFrame,
+    actuator_columns: Sequence[str],
+    mode_keys: Sequence[str],
+) -> dict[str, Any]:
+    per_actuator: dict[str, Any] = {}
+    for column in actuator_columns:
+        _, records = _completed_run_records(frame[column].tolist(), mode_keys)
+        per_actuator[column] = {
+            "completed_runs": sum(record["completed"] for record in records),
+            "eligible_runs": sum(record["eligible_for_training"] for record in records),
+            "excluded_final_ongoing_runs": sum(
+                record["exclusion_reason"] == "final_ongoing_run" for record in records
+            ),
+            "excluded_mode_crossing_runs": sum(
+                record["exclusion_reason"] == "crosses_mode_boundary" for record in records
+            ),
+            "runs": records,
+        }
+    return {
+        "duration_assignment": "completed run total assigned retrospectively to every run row",
+        "causal": False,
+        "final_ongoing_run": "excluded; duration is NaN",
+        "mode_crossing_runs": "excluded from training durations and transactions",
+        "actuators": per_actuator,
+    }
+
+
+def _transition_provenance(
+    mode_values: np.ndarray,
+    mode_keys: Sequence[str],
+) -> dict[str, Any]:
+    transitions = [
+        {
+            "row": int(index),
+            "previous_mode": _jsonable(mode_values[index - 1]),
+            "previous_mode_key": mode_keys[index - 1],
+            "mode": _jsonable(mode_values[index]),
+            "mode_key": mode_keys[index],
+        }
+        for index in range(1, len(mode_keys))
+        if mode_keys[index] != mode_keys[index - 1]
+    ]
+    return {
+        "ordinary_gradient": "within-mode rows only; mode-entry and frame-start rows excluded",
+        "transitiongradient": "first row entering a new mode only; keyed by current and previous mode",
+        "runtime_previous_mode": "previous row's predicted mode; no transition at frame start or after an unmatched row",
+        "transitions": transitions,
+    }
 
 
 def derive_predicates(
@@ -504,10 +629,11 @@ def derive_predicates(
     mode_column: str | None = None,
     inclusive_bounds: bool = True,
 ) -> list[Predicate]:
-    """Generate mode-scoped MinMax, Gradient, State, and SteadyTime predicates.
+    """Generate thesis-inspired predicates without requiring mlxtend.
 
-    This function is deliberately usable without mlxtend so that bound tests do
-    not need a working miner.
+    MinMax, Gradient, TransitionGradient and SteadyTime are mode-local.  State
+    items are deliberately global so identical actuator states shared by modes
+    have one item and can produce cross-mode confidence below one.
     """
     frame = _as_frame(frame)
     mode_values, mode_keys = _resolve_modes(frame, modes, mode_column)
@@ -518,83 +644,82 @@ def derive_predicates(
         raise ValueError(f"missing feature columns: {missing}")
 
     gradient = _gradient_frame(frame, sensors)
-    runs = {column: _run_lengths(frame[column].tolist()) for column in actuators}
+    ordinary_gradient = np.asarray([
+        index > 0 and mode_keys[index] == mode_keys[index - 1]
+        for index in range(len(frame))
+    ])
+    transition_groups: dict[tuple[str, str], list[int]] = {}
+    for index in range(1, len(frame)):
+        if mode_keys[index] != mode_keys[index - 1]:
+            transition_groups.setdefault((mode_keys[index], mode_keys[index - 1]), []).append(index)
 
     predicates: list[Predicate] = []
+    mode_representatives = {
+        key: value for value, key in zip(mode_values, mode_keys)
+    }
     for mode_key in sorted(set(mode_keys)):
-        indices = np.flatnonzero(np.array([key == mode_key for key in mode_keys]))
-        if len(indices) == 0:
-            continue
-        mode_value = mode_values[int(indices[0])]
+        indices = np.flatnonzero(np.asarray([key == mode_key for key in mode_keys]))
+        mode_value = mode_representatives[mode_key]
 
         for column in sensors:
             values = pd.to_numeric(frame.iloc[indices][column], errors="coerce").to_numpy(dtype=float)
             values = values[~np.isnan(values)]
             if len(values):
-                predicates.append(
-                    Predicate(
-                        kind="minmax",
-                        variable=column,
-                        mode=mode_value,
-                        mode_key=mode_key,
-                        lo=float(values.min()),
-                        hi=float(values.max()),
-                        n=int(len(values)),
-                        inclusive=bool(inclusive_bounds),
-                    )
-                )
+                predicates.append(Predicate(
+                    kind="minmax", variable=column, mode=mode_value, mode_key=mode_key,
+                    lo=float(values.min()), hi=float(values.max()), n=int(len(values)),
+                    inclusive=bool(inclusive_bounds),
+                ))
+            ordinary_indices = indices[ordinary_gradient[indices]]
+            gradients = gradient.iloc[ordinary_indices][column].to_numpy(dtype=float)
+            gradients = gradients[~np.isnan(gradients)]
+            if len(gradients):
+                predicates.append(Predicate(
+                    kind="gradient", variable=column, mode=mode_value, mode_key=mode_key,
+                    lo=float(gradients.min()), hi=float(gradients.max()),
+                    n=int(len(gradients)), inclusive=bool(inclusive_bounds),
+                ))
+
+        for column in actuators:
+            _, records = _completed_run_records(frame[column].tolist(), mode_keys)
+            eligible_by_state: dict[str, list[int]] = {}
+            for record in records:
+                if record["eligible_for_training"] and record["mode_keys"] == [mode_key]:
+                    eligible_by_state.setdefault(record["state_key"], []).append(record["duration"])
+            for state_key, run_durations in sorted(eligible_by_state.items()):
+                predicates.append(Predicate(
+                    kind="steadytime", variable=column, mode=mode_value, mode_key=mode_key,
+                    lo=float(min(run_durations)), hi=float(max(run_durations)),
+                    state_key=state_key, n=int(len(run_durations)),
+                    inclusive=bool(inclusive_bounds),
+                ))
+
+    for (mode_key, previous_mode_key), indices in sorted(transition_groups.items()):
+        for column in sensors:
             gradients = gradient.iloc[indices][column].to_numpy(dtype=float)
             gradients = gradients[~np.isnan(gradients)]
             if len(gradients):
-                predicates.append(
-                    Predicate(
-                        kind="gradient",
-                        variable=column,
-                        mode=mode_value,
-                        mode_key=mode_key,
-                        lo=float(gradients.min()),
-                        hi=float(gradients.max()),
-                        n=int(len(gradients)),
-                        inclusive=bool(inclusive_bounds),
-                    )
-                )
+                predicates.append(Predicate(
+                    kind="transitiongradient", variable=column,
+                    mode=mode_representatives[mode_key], mode_key=mode_key,
+                    previous_mode=mode_representatives[previous_mode_key],
+                    previous_mode_key=previous_mode_key,
+                    lo=float(gradients.min()), hi=float(gradients.max()),
+                    n=int(len(gradients)), inclusive=bool(inclusive_bounds),
+                ))
 
-        for column in actuators:
-            column_values = frame.iloc[indices][column].tolist()
-            state_keys = sorted(
-                {key for key in (_value_key(v) for v in column_values) if key is not None}
-            )
-            for state_key in state_keys:
-                state_rows = [
-                    int(index)
-                    for index in indices
-                    if _value_key(frame.iloc[int(index)][column]) == state_key
-                ]
-                predicates.append(
-                    Predicate(
-                        kind="state",
-                        variable=column,
-                        mode=mode_value,
-                        mode_key=mode_key,
-                        state_key=state_key,
-                        n=len(state_rows),
-                    )
-                )
-                durations = [runs[column][index] for index in state_rows if runs[column][index] > 0]
-                if durations:
-                    predicates.append(
-                        Predicate(
-                            kind="steadytime",
-                            variable=column,
-                            mode=mode_value,
-                            mode_key=mode_key,
-                            lo=float(min(durations)),
-                            hi=float(max(durations)),
-                            state_key=state_key,
-                            n=int(len(durations)),
-                            inclusive=bool(inclusive_bounds),
-                        )
-                    )
+    # Thesis Table 4.3: State is a shared transaction item, not a mode-keyed one.
+    for column in actuators:
+        column_values = frame[column].tolist()
+        state_keys = sorted({
+            key for key in (_value_key(value) for value in column_values) if key is not None
+        })
+        for state_key in state_keys:
+            predicates.append(Predicate(
+                kind="state", variable=column, mode=None, mode_key=None,
+                state_key=state_key,
+                n=sum(_value_key(value) == state_key for value in column_values),
+            ))
 
     predicates.sort(key=lambda predicate: predicate.item)
     return predicates
@@ -605,20 +730,24 @@ def bounds_artifact(predicates: Sequence[Predicate]) -> dict[str, Any]:
     out: dict[str, Any] = {
         "minmax": {},
         "gradient": {},
+        "transitiongradient": {},
         "steadytime": {},
         "actuator_states": {},
     }
     for predicate in predicates:
         mode = _display(predicate.mode)
-        if predicate.kind in ("minmax", "gradient"):
-            out[predicate.kind].setdefault(mode, {})[predicate.variable] = {
+        if predicate.kind in ("minmax", "gradient", "transitiongradient"):
+            bucket = out[predicate.kind].setdefault(mode, {})
+            if predicate.kind == "transitiongradient":
+                bucket = bucket.setdefault(_display(predicate.previous_mode), {})
+            bucket[predicate.variable] = {
                 "lo": None if predicate.lo is None else _finite_or_none(predicate.lo),
                 "hi": None if predicate.hi is None else _finite_or_none(predicate.hi),
                 "n": int(predicate.n),
                 "inclusive": bool(predicate.inclusive),
             }
         elif predicate.kind == "state":
-            bucket = out["actuator_states"].setdefault(mode, {}).setdefault(predicate.variable, [])
+            bucket = out["actuator_states"].setdefault("*", {}).setdefault(predicate.variable, [])
             bucket.append(predicate.state_key)
         elif predicate.kind == "steadytime":
             out["steadytime"].setdefault(mode, {}).setdefault(predicate.variable, {})[
@@ -668,44 +797,12 @@ def _load_mlxtend() -> SimpleNamespace:
     except Exception as exc:  # pragma: no cover - exercised through monkeypatch
         raise MissingMinerError(
             "IM-DISCO requires the mlxtend FP-Growth and association_rules "
-            "implementations (paper: FP-Growth min_support=0.05, "
-            "association_rules confidence>=1.0). mlxtend is not installed or "
-            "cannot be imported; no alternate miner is bundled. "
-            "Install mlxtend and re-run."
+            "implementations for prune_subsumed_rules=False (paper: FP-Growth "
+            "min_support=0.05, association_rules confidence>=1.0). mlxtend is "
+            "not installed or cannot be imported. Install mlxtend for the "
+            "uncapped arm, or use the default exact maximal-rule adaptation."
         ) from exc
     return SimpleNamespace(fpgrowth=fpgrowth, association_rules=association_rules)
-
-
-def _estimate_frequent_itemsets(
-    predicates: Sequence[Predicate],
-    mode_keys: Sequence[str],
-    *,
-    minsup: float,
-    max_itemset_len: int | None,
-) -> int:
-    """Conservative upper bound for own-mode transaction itemsets.
-
-    Every predicate derived for a mode holds on every training row of that
-    mode (inclusive bounds), so all subsets of a frequent mode co-occur.  Modes
-    below ``minsup`` contribute no frequent items.
-    """
-    if not mode_keys:
-        return 0
-    per_mode: dict[str, int] = {}
-    for predicate in predicates:
-        per_mode[predicate.mode_key] = per_mode.get(predicate.mode_key, 0) + 1
-    row_counts: dict[str, int] = {}
-    for key in mode_keys:
-        row_counts[key] = row_counts.get(key, 0) + 1
-    n_rows = len(mode_keys)
-    total = 0
-    for key, predicate_count in per_mode.items():
-        if row_counts.get(key, 0) / n_rows < float(minsup):
-            continue
-        item_count = predicate_count + 1  # predicates plus the mode item
-        top = item_count if max_itemset_len is None else min(int(max_itemset_len), item_count)
-        total += sum(math.comb(item_count, size) for size in range(1, top + 1))
-    return total
 
 
 def _transactions(
@@ -717,18 +814,30 @@ def _transactions(
     runs: Mapping[str, np.ndarray],
 ) -> tuple[pd.DataFrame, list[str]]:
     by_mode: dict[str, list[Predicate]] = {}
+    shared: list[Predicate] = []
     for predicate in predicates:
-        by_mode.setdefault(predicate.mode_key, []).append(predicate)
+        if predicate.mode_key is None:
+            shared.append(predicate)
+        else:
+            by_mode.setdefault(predicate.mode_key, []).append(predicate)
 
     rows: list[set[str]] = []
     for i in range(len(frame)):
-        values = frame.iloc[i].to_dict()
+        values = {column: frame[column].iat[i] for column in frame.columns}
         gradients = gradient.iloc[i].to_dict()
         run_lengths = {column: values_series[i] for column, values_series in runs.items()}
+        previous_mode_key = mode_keys[i - 1] if i > 0 else None
+        applicable = [*shared, *by_mode.get(mode_keys[i], ())]
         items = {
             predicate.item
-            for predicate in by_mode.get(mode_keys[i], ())
-            if predicate.evaluate(values=values, gradients=gradients, run_lengths=run_lengths)
+            for predicate in applicable
+            if predicate.evaluate(
+                values=values,
+                gradients=gradients,
+                run_lengths=run_lengths,
+                previous_mode_key=previous_mode_key,
+                frame_start=i == 0,
+            )
         }
         items.add(_mode_item(mode_keys[i]))
         rows.append(items)
@@ -740,6 +849,212 @@ def _transactions(
         for item in row:
             matrix[row_index, positions[item]] = True
     return pd.DataFrame(matrix, columns=columns), columns
+
+
+def _row_bitsets(transactions: pd.DataFrame, columns: Sequence[str]) -> list[int]:
+    """Encode transaction rows as Python integer bitsets, one bit per column."""
+    if not columns:
+        return [0] * len(transactions)
+    matrix = transactions.loc[:, list(columns)].to_numpy(dtype=bool)
+    rows: list[int] = []
+    for row in matrix:
+        bitset = 0
+        for position in np.flatnonzero(row):
+            bitset |= 1 << int(position)
+        rows.append(bitset)
+    return rows
+
+
+def _closed_patterns(patterns: Iterable[int]) -> set[int]:
+    """Compute the intersection-closed family of distinct transaction patterns."""
+    closed = set(patterns)
+    for bitset in tuple(closed):
+        closed |= {candidate & bitset for candidate in tuple(closed)}
+    return closed
+
+
+def _maximal_patterns(patterns: Iterable[int]) -> list[int]:
+    candidates = set(patterns)
+    return sorted(
+        (
+            candidate for candidate in candidates
+            if not any(
+                candidate != other and candidate & ~other == 0
+                for other in candidates
+            )
+        ),
+        key=lambda bitset: (-bitset.bit_count(), bitset),
+    )
+
+
+def _subset_union_count(maximal_patterns: Sequence[int], *, include_empty: bool) -> int:
+    """Count a union of subset lattices exactly by inclusion--exclusion."""
+    if not maximal_patterns:
+        return 1 if include_empty else 0
+    total = 0
+    for size in range(1, len(maximal_patterns) + 1):
+        sign = 1 if size % 2 else -1
+        for combination in itertools.combinations(maximal_patterns, size):
+            intersection = combination[0]
+            for candidate in combination[1:]:
+                intersection &= candidate
+            total += sign * (1 << intersection.bit_count())
+    return total if include_empty else total - 1
+
+
+def _count_frequent_itemsets(
+    transactions: pd.DataFrame,
+    *,
+    min_support_count: int,
+) -> tuple[int, dict[str, int]]:
+    """Count uncapped frequent itemsets from maximal frequent closed patterns."""
+    columns = list(transactions.columns)
+    pattern_counts: Counter[int] = Counter(_row_bitsets(transactions, columns))
+    closed = _closed_patterns(pattern_counts)
+
+    def support(candidate: int) -> int:
+        return sum(
+            count for bitset, count in pattern_counts.items()
+            if candidate & ~bitset == 0
+        )
+
+    frequent_closed = {
+        candidate for candidate in closed if support(candidate) >= min_support_count
+    }
+    maximal = _maximal_patterns(frequent_closed)
+    count = _subset_union_count(maximal, include_empty=False)
+    return count, {
+        "n_closed_itemsets_including_empty": len(closed),
+        "n_frequent_closed_itemsets_including_empty": len(frequent_closed),
+        "n_maximal_frequent_closed_itemsets_including_empty": len(maximal),
+    }
+
+
+def _maximal_rules_from_transactions(
+    transactions: pd.DataFrame,
+    predicate_by_item: Mapping[str, Predicate],
+    mode_by_item: Mapping[str, Any],
+    *,
+    mode_key_by_item: Mapping[str, str],
+    minsup: float,
+    minconf: float,
+) -> tuple[list[InvariantRule], dict[str, Any]]:
+    """Exact maximal mode rules without FP-Growth/ARG materialization.
+
+    A non-closed antecedent is always subsumed by its closure, which has the
+    same total and mode-joint supports.  Consequently the maximal retained
+    rules are precisely the maximal qualifying frequent closed antecedents.
+    Shared State items are handled by total (cross-mode) antecedent support.
+    """
+    n_transactions = len(transactions)
+    min_support_count = int(math.ceil(float(minsup) * n_transactions))
+    predicate_columns = [column for column in transactions.columns if column not in mode_by_item]
+    mode_items = list(mode_by_item)
+    row_predicates = _row_bitsets(transactions, predicate_columns)
+    row_modes = _row_bitsets(transactions, mode_items)
+    mode_position = {
+        index: mode_key_by_item[item] for index, item in enumerate(mode_items)
+    }
+    pattern_counts: Counter[int] = Counter()
+    pattern_mode_counts: Counter[tuple[int, str]] = Counter()
+    for predicates, modes in zip(row_predicates, row_modes):
+        mode_positions = [index for index in mode_position if modes & (1 << index)]
+        if len(mode_positions) != 1:
+            raise ValueError("each transaction must contain exactly one mode item")
+        pattern_counts[predicates] += 1
+        pattern_mode_counts[(predicates, mode_position[mode_positions[0]])] += 1
+
+    closed = _closed_patterns(pattern_counts)
+    mode_row_counts = {
+        mode_key: sum(
+            count for (pattern, key), count in pattern_mode_counts.items() if key == mode_key
+        )
+        for mode_key in set(mode_position.values())
+    }
+
+    def total_support(candidate: int) -> int:
+        return sum(
+            count for pattern, count in pattern_counts.items()
+            if candidate & ~pattern == 0
+        )
+
+    def mode_support(candidate: int, mode_key: str) -> int:
+        return sum(
+            count for (pattern, key), count in pattern_mode_counts.items()
+            if key == mode_key and candidate & ~pattern == 0
+        )
+
+    frequent_closed = {
+        candidate for candidate in closed
+        if candidate and total_support(candidate) >= min_support_count
+    }
+    maximal_by_mode: dict[str, list[int]] = {}
+    qualified_closed_rules = 0
+    for mode_key in sorted(mode_row_counts):
+        qualified: list[int] = []
+        for candidate in frequent_closed:
+            antecedent_count = total_support(candidate)
+            joint_count = mode_support(candidate, mode_key)
+            if joint_count < min_support_count:
+                continue
+            confidence = joint_count / antecedent_count
+            if confidence >= float(minconf) - 1e-12:
+                qualified.append(candidate)
+        qualified_closed_rules += len(qualified)
+        maximal_by_mode[mode_key] = _maximal_patterns(qualified)
+
+    rules: list[InvariantRule] = []
+    mode_value_by_key = {
+        mode_key_by_item[item]: value for item, value in mode_by_item.items()
+    }
+    for mode_key, maximal in maximal_by_mode.items():
+        for candidate in maximal:
+            antecedent_count = total_support(candidate)
+            joint_count = mode_support(candidate, mode_key)
+            items = [
+                predicate_columns[position]
+                for position in range(len(predicate_columns))
+                if candidate & (1 << position)
+            ]
+            predicates = tuple(predicate_by_item[item] for item in sorted(items))
+            rules.append(InvariantRule(
+                mode=mode_value_by_key[mode_key],
+                mode_key=mode_key,
+                antecedent=predicates,
+                support=joint_count / n_transactions,
+                confidence=joint_count / antecedent_count,
+                lift=(
+                    joint_count * n_transactions
+                    / (antecedent_count * mode_row_counts[mode_key])
+                ),
+            ))
+
+    frequent_itemset_count, frequent_stats = _count_frequent_itemsets(
+        transactions, min_support_count=min_support_count
+    )
+    stats: dict[str, Any] = {
+        "miner": "exact frequent closed transaction patterns + subsumption pruning",
+        "minsup": float(minsup),
+        "minconf": float(minconf),
+        "min_support_count": min_support_count,
+        "n_closed_antecedent_patterns_including_empty": len(closed),
+        "n_frequent_closed_antecedents": len(frequent_closed),
+        "n_qualified_closed_rules": int(qualified_closed_rules),
+        "n_frequent_itemsets": int(frequent_itemset_count),
+        "n_rules_before_pruning": None,
+        "n_rules_before_pruning_status": (
+            "not materialized or estimated: shared State items make confidence "
+            "non-monotone under antecedent subsets; the qualified-closed-rule "
+            "intermediate count and final maximal count are reported separately"
+        ),
+        "n_rules": len(rules),
+        "frequent_itemsets_materialized": False,
+        "unpruned_rules_materialized": False,
+        "unpruned_count_method": "not used by the exact maximal-rule adaptation",
+        "association_rules_num_itemsets_kwarg": False,
+        **frequent_stats,
+    }
+    return rules, stats
 
 
 def _rule_dataframe(
@@ -944,6 +1259,8 @@ class IMDISCO:
         self._predicates: tuple[Predicate, ...] = ()
         self._predicate_by_item: dict[str, Predicate] = {}
         self._bounds: dict[str, Any] = {}
+        self._steadytime: dict[str, Any] = {}
+        self._transitions: dict[str, Any] = {}
         self._rules: tuple[InvariantRule, ...] = ()
         self._rules_by_mode_key: dict[str, tuple[InvariantRule, ...]] = {}
         self._mode_counts: dict[str, int] = {}
@@ -976,61 +1293,87 @@ class IMDISCO:
         mode_key_by_item = {_mode_item(key): key for key in mode_keys}
 
         gradient = _gradient_frame(frame, sensors)
-        runs = {column: _run_lengths(frame[column].tolist()) for column in actuators}
+        runs = {
+            column: _completed_run_records(frame[column].tolist(), mode_keys)[0]
+            for column in actuators
+        }
         transactions, columns = _transactions(
             frame, mode_values, mode_keys, predicates, gradient, runs
         )
 
-        estimated_itemsets = _estimate_frequent_itemsets(
-            predicates,
-            mode_keys,
-            minsup=self.config.minsup,
-            max_itemset_len=self.config.max_itemset_len,
-        )
-        if (
-            self.config.max_frequent_itemsets is not None
-            and estimated_itemsets > int(self.config.max_frequent_itemsets)
-        ):
-            raise MiningTooLargeError(
-                f"FP-Growth is estimated to produce {estimated_itemsets} frequent "
-                f"itemsets (cap {self.config.max_frequent_itemsets}) because "
-                "mode-local predicates co-occur. Lower IMDISCOConfig.max_itemset_len "
-                "or raise max_frequent_itemsets explicitly."
-            )
-
-        miner = _load_mlxtend()
-        mining_kwargs: dict[str, Any] = {
-            "min_support": float(self.config.minsup),
-            "use_colnames": True,
-        }
-        if self.config.max_itemset_len is not None:
-            mining_kwargs["max_len"] = int(self.config.max_itemset_len)
-        frequent_itemsets = miner.fpgrowth(transactions, **mining_kwargs)
-        if self.config.max_frequent_itemsets is not None and len(frequent_itemsets) > int(
-            self.config.max_frequent_itemsets
-        ):
-            raise MiningTooLargeError(
-                f"FP-Growth produced {len(frequent_itemsets)} frequent itemsets "
-                f"(cap {self.config.max_frequent_itemsets}). Set "
-                "IMDISCOConfig.max_itemset_len or raise the cap explicitly."
-            )
-
-        rule_frame, num_itemsets_used = _rule_dataframe(
-            miner,
-            frequent_itemsets,
-            minconf=self.config.minconf,
-            n_transactions=len(transactions),
-        )
-        rules = _rules_from_dataframe(
-            rule_frame,
-            predicate_by_item,
-            mode_by_item,
-            mode_key_by_item=mode_key_by_item,
-            minconf=self.config.minconf,
-        )
-        before_pruning = len(rules)
         if self.config.prune_subsumed_rules:
-            rules = _prune_subsumed(rules)
+            if self.config.max_itemset_len is not None:
+                raise ValueError(
+                    "the exact maximal-rule arm requires max_itemset_len=None; "
+                    "use prune_subsumed_rules=False for a caller-chosen FP-Growth cap"
+                )
+            rules, mining_stats = _maximal_rules_from_transactions(
+                transactions,
+                predicate_by_item,
+                mode_by_item,
+                mode_key_by_item=mode_key_by_item,
+                minsup=self.config.minsup,
+                minconf=self.config.minconf,
+            )
+            num_itemsets_used = False
+            estimated_itemsets = mining_stats["n_frequent_itemsets"]
+        else:
+            # The closed-pattern count is an exact guard, not a substitute for
+            # the explicitly requested uncapped FP-Growth/ARG execution.
+            estimated_itemsets, closed_count_stats = _count_frequent_itemsets(
+                transactions,
+                min_support_count=int(math.ceil(self.config.minsup * len(frame))),
+            )
+            if (
+                self.config.max_itemset_len is None
+                and self.config.max_frequent_itemsets is not None
+                and estimated_itemsets > int(self.config.max_frequent_itemsets)
+            ):
+                raise MiningTooLargeError(
+                    f"uncapped FP-Growth has exactly {estimated_itemsets} frequent "
+                    f"itemsets (cap {self.config.max_frequent_itemsets}). Use the "
+                    "default exact maximal-rule adaptation, set max_itemset_len "
+                    "explicitly, or raise the cap explicitly."
+                )
+
+            miner = _load_mlxtend()
+            mining_kwargs: dict[str, Any] = {
+                "min_support": float(self.config.minsup),
+                "use_colnames": True,
+            }
+            if self.config.max_itemset_len is not None:
+                mining_kwargs["max_len"] = int(self.config.max_itemset_len)
+            frequent_itemsets = miner.fpgrowth(transactions, **mining_kwargs)
+            if self.config.max_frequent_itemsets is not None and len(frequent_itemsets) > int(
+                self.config.max_frequent_itemsets
+            ):
+                raise MiningTooLargeError(
+                    f"FP-Growth produced {len(frequent_itemsets)} frequent itemsets "
+                    f"(cap {self.config.max_frequent_itemsets}). Set "
+                    "IMDISCOConfig.max_itemset_len or raise the cap explicitly."
+                )
+
+            rule_frame, num_itemsets_used = _rule_dataframe(
+                miner,
+                frequent_itemsets,
+                minconf=self.config.minconf,
+                n_transactions=len(transactions),
+            )
+            rules = _rules_from_dataframe(
+                rule_frame,
+                predicate_by_item,
+                mode_by_item,
+                mode_key_by_item=mode_key_by_item,
+                minconf=self.config.minconf,
+            )
+            mining_stats = {
+                "miner": "mlxtend.frequent_patterns.fpgrowth + association_rules",
+                "n_frequent_itemsets": int(len(frequent_itemsets)),
+                "n_rules_before_pruning": len(rules),
+                "frequent_itemsets_materialized": True,
+                "unpruned_rules_materialized": True,
+                **closed_count_stats,
+            }
 
         ordered_keys = tuple(_value_key(mode) for mode in mode_order)
         mode_index = {key: index for index, key in enumerate(ordered_keys)}
@@ -1062,23 +1405,23 @@ class IMDISCO:
         self._predicates = tuple(predicates)
         self._predicate_by_item = predicate_by_item
         self._bounds = bounds_artifact(predicates)
+        self._steadytime = _steadytime_provenance(frame, actuators, mode_keys)
+        self._transitions = _transition_provenance(mode_values, mode_keys)
         self._rules = tuple(rules)
         self._rules_by_mode_key = {key: tuple(value) for key, value in rules_by_mode.items()}
         self._mode_counts = counts
         self._training_rows = int(len(frame))
         self._association_rules_num_itemsets = bool(num_itemsets_used)
         self._mining = {
-            "miner": "mlxtend.frequent_patterns.fpgrowth + association_rules",
+            **mining_stats,
             "mlxtend": _mlxtend_info(),
             "minsup": float(self.config.minsup),
             "minconf": float(self.config.minconf),
             "max_itemset_len": self.config.max_itemset_len,
-            "estimated_frequent_itemsets_upper_bound": int(estimated_itemsets),
+            "uncapped_frequent_itemsets_exact_count": int(estimated_itemsets),
             "prune_subsumed_rules": bool(self.config.prune_subsumed_rules),
             "n_transactions": int(len(transactions)),
             "n_items": int(len(columns)),
-            "n_frequent_itemsets": int(len(frequent_itemsets)),
-            "n_rules_before_pruning": int(before_pruning),
             "n_rules": int(len(rules)),
             "association_rules_num_itemsets_kwarg": bool(num_itemsets_used),
         }
@@ -1135,9 +1478,10 @@ class IMDISCO:
         anomaly_flags = np.zeros(len(frame), dtype=int)
         anomaly_scores = np.zeros(len(frame), dtype=float)
         matched_rule_ids: list[str | None] = []
+        previous_mode_key: str | None = None
 
         for i in range(len(frame)):
-            values = frame.iloc[i].to_dict()
+            values = {column: frame[column].iat[i] for column in frame.columns}
             gradients = gradient.iloc[i].to_dict()
             run_lengths = {column: values_series[i] for column, values_series in runs.items()}
             chosen: InvariantRule | None = None
@@ -1145,7 +1489,11 @@ class IMDISCO:
             for mode_key in self._mode_order_keys:
                 for rule in self._rules_by_mode_key.get(mode_key, ()):
                     if rule.evaluate(
-                        values=values, gradients=gradients, run_lengths=run_lengths
+                        values=values,
+                        gradients=gradients,
+                        run_lengths=run_lengths,
+                        previous_mode_key=previous_mode_key,
+                        frame_start=i == 0,
                     ):
                         chosen = rule
                         chosen_mode = rule.mode
@@ -1162,6 +1510,7 @@ class IMDISCO:
                 anomaly_scores[i] = 0.0
                 predicted_modes.append(chosen_mode)
                 matched_rule_ids.append(chosen.rule_id)
+            previous_mode_key = _value_key(chosen_mode) if chosen is not None else None
 
         return PredictionResult(
             predicted_modes=tuple(predicted_modes),
@@ -1189,20 +1538,29 @@ class IMDISCO:
         info = _mlxtend_info()
         return {
             "schema_version": SCHEMA_VERSION,
-            "paper": "Saraiva, Apolinario & Pardal, IM-DISCO (full paper)",
-            "method": "MinMax + first-gradient + SteadyTime predicates; "
-            "FP-Growth (minsup=0.05) + association rules (minconf=1.0) with mode consequent",
-            "miner": "mlxtend.frequent_patterns.fpgrowth + association_rules",
+            "paper": "Saraiva, Apolinario & Pardal, IM-DISCO (paper and 2023 thesis)",
+            "method": (
+                "mode-local MinMax/Gradient/TransitionGradient/SteadyTime + shared State; "
+                "default exact maximal closed-pattern rules, optional uncapped mlxtend "
+                "FP-Growth + association_rules with mode consequent"
+            ),
+            "miner": self._mining.get(
+                "miner", "exact maximal by default; uncapped mlxtend when pruning is false"
+            ),
             "mlxtend_available": info["available"],
             "mlxtend_version": info["version"],
             "original_rule_ordering_available": False,
             "missing_original_rule_ordering": True,
             "original_artifacts_available": False,
+            "complete_original_implementation_available": False,
+            "partial_source_snippets_available": True,
             "artifact_availability": {
-                "paper_code": False,
+                "paper_code": "partial source snippets in thesis Appendix A, not complete code",
+                "complete_paper_code": False,
                 "paper_rule_files": False,
                 "paper_training_data": False,
                 "paper_prediction_order": False,
+                "thesis": "https://scholar.tecnico.ulisboa.pt/records/LmNvJf4G1Zrcca0CmVSN_A7JNLQxYDwTC6SA",
             },
             "rule_order_policy": (
                 "mode order: explicit IMDISCOConfig.mode_order when supplied, otherwise "
@@ -1211,11 +1569,32 @@ class IMDISCO:
                 "not publish its original rule ordering, so this order is a documented "
                 "deterministic reconstruction."
             ),
-            "rule_pruning": (
-                "disabled by default: the paper selects rules only by minconf, so "
-                "no subsumption pruning is applied unless the caller explicitly "
-                "sets IMDISCOConfig.prune_subsumed_rules=True"
-            ),
+            "rule_pruning": {
+                "default": "exact maximal-rule thesis-inspired adaptation",
+                "thesis_evidence": (
+                    "Section 4.4.2 and Listing A.3 specify redundancy removal after ARG: "
+                    "antecedents contained in other antecedents are removed"
+                ),
+                "paper_evidence": (
+                    "Section 5.4 reports one maximal conjunction per mode but does not "
+                    "specify the reduction algorithm"
+                ),
+                "exactness": (
+                    "frequent closed antecedents plus strict-subsumption pruning compute "
+                    "the same final rules as uncapped FP-Growth/ARG followed by "
+                    "_prune_subsumed; unpruned FP-Growth remains potentially exponential"
+                ),
+                "uncapped_arm": "set prune_subsumed_rules=False",
+                "official_code_reproduction": False,
+            },
+            "predicate_identity": {
+                "mode_local": ["minmax", "gradient", "transitiongradient", "steadytime"],
+                "shared_across_modes": ["state"],
+                "cross_mode_confidence": (
+                    "shared State support is computed across all modes, so State=>mode "
+                    "confidence can be below one; the mode item remains a separate consequent"
+                ),
+            },
             "mode_order_policy": (
                 "caller-supplied mode_order, else lexicographic mode-label ascending"
             ),
@@ -1226,12 +1605,21 @@ class IMDISCO:
                     "use <=. Inclusive bounds are the default so observed extrema remain "
                     "valid; set inclusive_bounds=False to restore the printed formulas."
                 ),
-                "first_gradient": "0.0 (the paper does not define the first row's gradient)",
-                "steadytime": (
-                    "run length counts consecutive identical actuator values over the "
-                    "supplied frame; the first row starts at 1 and mode-local bounds are "
-                    "computed from rows labelled with that mode"
+                "first_gradient": (
+                    "no ordinary Gradient at frame start or mode entry; raw diff still "
+                    "defines first-row scratch value as 0.0"
                 ),
+                "gradient": "ordinary within-mode differences only",
+                "transitiongradient": (
+                    "separate current/previous-mode-keyed predicate at the first row "
+                    "entering a mode only, never subsequent rows of that mode"
+                ),
+                "steadytime": (
+                    "completed run total duration is assigned retrospectively to every "
+                    "row of the run; final ongoing runs are excluded; mode-crossing runs "
+                    "are excluded from training with per-run provenance"
+                ),
+                "steadytime_causal": False,
                 "missing_values": "missing sensor/actuator values never satisfy a predicate",
             },
             "runtime_conventions": {
@@ -1240,15 +1628,18 @@ class IMDISCO:
                 "out_of_training": "anomalous when no invariant rule matches",
                 "anomaly_score": "coarse binary: 0.0 matched, 1.0 unmatched",
                 "gradient_and_run_lengths_reset_at_frame_start": True,
+                "steadytime_retrospective_noncausal": True,
+                "transition_previous_mode": "previous predicted mode, not an attack or expert label",
             },
             "reproduction_gaps": [
-                "the original rule ordering is not reported in the paper",
-                "the original code, rule files, and ride data are not published",
-                "strict vs inclusive bound notation differs between Sections 3.3 and 5.3",
-                "the first-row gradient and run-length boundary rules are unspecified",
-                "the paper does not specify how a SteadyTime run crossing a mode boundary is attributed",
-                "the paper specifies all frequent itemsets with minsup=0.05 and no maximum length; this implementation defaults to no length cap and fails explicitly through max_frequent_itemsets when tractability is exceeded",
-                "runtime gradients and SteadyTime runs restart at the first row of each prediction frame",
+                "the original rule ordering is not reported",
+                "the thesis provides partial source snippets, not the complete implementation, rule files, or ride data",
+                "the thesis specifies redundancy removal after ARG but not its reduction algorithm",
+                "strict vs inclusive bound notation differs between formulas and examples",
+                "mode-crossing SteadyTime runs are excluded as an explicit adaptation",
+                "completed-run totals are retrospective and noncausal at runtime",
+                "TransitionGradient is entry-only here and runtime mode boundaries use the previous predicted mode",
+                "the default maximal arm avoids exponential materialization; the original uncapped FP-Growth/ARG arm remains potentially exponential",
                 "average precision is coarse because matched/unmatched is binary",
             ],
             "training": (
@@ -1277,6 +1668,8 @@ class IMDISCO:
                 "mode_counts": dict(sorted(self._mode_counts.items())),
             },
             "bounds": self._bounds,
+            "steadytime": self._steadytime,
+            "transitions": self._transitions,
             "predicates": [predicate.to_dict() for predicate in self._predicates],
             "rules": [rule.to_dict() for rule in self._rules],
             "mining": dict(self._mining),

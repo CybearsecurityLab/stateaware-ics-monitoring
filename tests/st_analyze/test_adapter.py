@@ -84,6 +84,69 @@ def test_multi_actuator_analysis_aggregates_every_case_block():
     assert len(actuation) == 4
 
 
+def test_multi_actuator_pdgs_retain_component_identity_and_statement_order():
+    r = analyze_source(MULTI_ACTUATOR_ST)
+    assert r.ok is True, r.errors
+    assert r.pdg_components is r.pdg_structured["components"]
+    assert [c["case_var"] for c in r.pdg_components] == [
+        "P1_State", "P2_State"
+    ]
+    assert {c["plc"] for c in r.pdg_components} == {"PLC1"}
+
+    identities = []
+    for component in r.pdg_components:
+        assert [s["state_id"] for s in component["states"]] == ["0", "1"]
+        for state in component["states"]:
+            identities.append((
+                component["plc"], component["case_var"], state["state_id"]
+            ))
+        statements = [
+            node["statement"] for node in component["states"][0]["nodes"]
+        ]
+        actuator = component["case_var"].removesuffix("_State")
+        sensor = "T1" if actuator == "P1" else "T2"
+        assert statements == [
+            f"{actuator} := FALSE",
+            f"IF {sensor} < 5",
+            f"{actuator}_State := 1",
+        ]
+        assert component["states"][0]["edges"][0]["label"] == "then"
+
+    # Identical local state IDs do not overwrite another actuator's graph.
+    assert len(identities) == len(set(identities)) == 4
+    first_writes = {
+        component["case_var"]: {
+            write
+            for state in component["states"]
+            for node in state["nodes"]
+            for write in node["writes"]
+        }
+        for component in r.pdg_components
+    }
+    assert first_writes == {
+        "P1_State": {"P1", "P1_State"},
+        "P2_State": {"P2", "P2_State"},
+    }
+
+    # Existing state-keyed readers still see the final CASE, as before.
+    assert set(r.pdg_structured) == {"0", "1", "components"}
+    assert r.pdg_structured["0"]["nodes"][0]["statement"] == "P2 := FALSE"
+
+
+def test_multi_actuator_dot_is_complete_and_namespaced():
+    r = analyze_source(MULTI_ACTUATOR_ST)
+    assert r.pdg_dot.count("subgraph cluster_") == 4
+    assert "cluster_c0_PLC1_P1_State_s0" in r.pdg_dot
+    assert "cluster_c1_PLC1_P2_State_s0" in r.pdg_dot
+    for statement in (
+        "P1 := FALSE", "P1 := TRUE", "P2 := FALSE", "P2 := TRUE",
+        "IF T1 < 5", "IF T2 > 8",
+    ):
+        assert statement in r.pdg_dot
+    assert "c0_PLC1_P1_State_s0_n1 -> c0_PLC1_P1_State_s0_n2" in r.pdg_dot
+    assert "c1_PLC1_P2_State_s1_n1 -> c1_PLC1_P2_State_s1_n2" in r.pdg_dot
+
+
 def test_analyze_empty_program_is_ok_not_crash():
     r = analyze_source(EMPTY_ST)
     assert r.ok is True
@@ -97,6 +160,7 @@ def test_invariants_are_json_serializable_dicts():
     json.dumps(r.invariants)  # raises if not serializable
     for inv in r.invariants:
         assert "type" in inv and "id" in inv
+        assert inv["case_var"] == "P1_State"
 
 
 def test_malformed_source_sets_not_ok_without_raising():

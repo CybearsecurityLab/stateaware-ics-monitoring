@@ -70,7 +70,25 @@ def fake_detectors(monkeypatch):
 
     monkeypatch.setattr(sweep.export, "TopologyStlDetector", Detector)
     monkeypatch.setattr(sweep.export, "_stl_predict", stl_predict)
+    class Obligations:
+        def __init__(self, **kwargs):
+            pass
+
+        def fit(self, frames):
+            return self
+
+        def predict(self, frame):
+            flags = np.zeros(len(frame), dtype=int)
+            return type("Result", (), {"flags": flags})()
+
+        def predict_detailed(self, frame):
+            flags = np.zeros(len(frame), dtype=int)
+            return type("Result", (), {
+                "flags": flags, "scores": flags.astype(float), "reasons": [],
+            })()
+
     monkeypatch.setattr(sweep.export, "GfsmAnomalyDetector", Gfsm)
+    monkeypatch.setattr(sweep, "GfsmObligationDetector", Obligations)
 
 
 def test_ltown_external_nominal_labels_immutability(tmp_path, monkeypatch, fake_detectors):
@@ -170,6 +188,11 @@ def test_arm_metrics_keep_gfsm_and_stl_scores_distinct():
         "scenario": ["nominal", "nominal", "attack", "attack"],
         "y_true": [0, 0, 1, 1],
         "y_pred_gfsm": [0, 0, 0, 1],
+        "y_pred_gfsm_timing": [0, 0, 0, 0],
+        "y_pred_gfsm_obligations": [0, 0, 0, 0],
+        "gfsm_obligation_score": [0.0, 0.0, 0.0, 0.0],
+        "y_pred_combined_obligations": [0, 1, 0, 1],
+        "combined_obligations_score": [0.0, 3.0, 0.0, 2.0],
         "y_pred_phi": [0, 0, 0, 0],
         "phi_score": [0.0, 0.0, 0.0, 0.0],
         "y_pred_stl": [0, 1, 0, 1],
@@ -200,6 +223,11 @@ def test_observation_aware_metrics_preserve_injection_labels():
         "y_true": [1, 0, 0],
         "y_true_observation_aware": np.logical_or([1, 0, 0], visible).astype(int),
         "y_pred_gfsm": [0, 1, 0], "y_pred_stl": [0, 0, 0],
+        "y_pred_gfsm_timing": [0, 0, 0],
+        "y_pred_gfsm_obligations": [0, 0, 0],
+        "gfsm_obligation_score": [0., 0., 0.],
+        "y_pred_combined_obligations": [0, 1, 0],
+        "combined_obligations_score": [0., 1., 0.],
         "y_pred_phi": [0, 0, 0], "phi_score": [0., 0., 0.],
         "y_pred": [0, 1, 0], "stl_score": [0., 0., 0.],
         "combined_score": [0., 1., 0.], "uncalibrated_count": [0, 0, 0],

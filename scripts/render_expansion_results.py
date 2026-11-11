@@ -8,19 +8,28 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from baselines.sain import SAIN_QUANTMINER_CONFIG
 from stl.metrics import detection_metrics
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "paper/State-Aware-ICS-Security/results_expansion.tex"
 TOPOLOGIES = ("anytown", "ctown", "ltown")
 ARMS = (("gfsm", "y_pred_gfsm", "y_pred_gfsm"),
+        ("gfsm_timing", "y_pred_gfsm_timing", "y_pred_gfsm_timing"),
+        ("gfsm_obligations", "y_pred_gfsm_obligations", "gfsm_obligation_score"),
         ("phi", "y_pred_phi", "phi_score"),
         ("stl", "y_pred_stl", "stl_score"),
-        ("combined", "y_pred", "combined_score"))
+        ("combined", "y_pred", "combined_score"),
+        ("combined_obligations", "y_pred_combined_obligations", "combined_obligations_score"))
 
 
 def fmt(value: float, *, best: bool = False) -> str:
     text = f"{value:.4f}"
+    return f"\\textbf{{{text}}}" if best else text
+
+
+def fmt_baseline(value: float, *, best: bool = False) -> str:
+    text = f"{value:.3f}"
     return f"\\textbf{{{text}}}" if best else text
 
 
@@ -35,7 +44,15 @@ def ablation() -> str:
                 for key in ("mcc", "balanced_accuracy", "aucpr")}
         for index, ((arm, _, _), values) in enumerate(zip(ARMS, metrics)):
             prefix = {"anytown": "Anytown", "ctown": "C-Town", "ltown": "L-Town"}[topology] if index == 0 else " "
-            arm_label = {"gfsm": "GFSM", "phi": r"$\Phi$", "stl": "STL", "combined": "Combined"}[arm]
+            arm_label = {
+                "gfsm": "G",
+                "gfsm_timing": "T",
+                "gfsm_obligations": "O",
+                "phi": r"$\Phi$",
+                "stl": "STL",
+                "combined": "C",
+                "combined_obligations": "C+O",
+            }[arm]
             lines.append(
                 f"{prefix} & {arm_label} & "
                 f"{fmt(values['mcc'], best=values['mcc'] == best['mcc'])} & "
@@ -49,7 +66,38 @@ def ablation() -> str:
 
 
 def baseline_one(method: str, topology: str) -> dict | None:
-    path = ROOT / f"scripts/out/full_signal_{method}/{topology}/predictions.csv"
+    if method in {"framework", "framework_obligations"}:
+        frame = pd.read_csv(
+            ROOT / f"scripts/out/logic_attack_predictions/{topology}/detector_predictions.csv"
+        )
+        flag = "y_pred" if method == "framework" else "y_pred_combined_obligations"
+        score = "combined_score" if method == "framework" else "combined_obligations_score"
+        return {
+            "status": "ok",
+            "metrics": detection_metrics(frame["y_true"], frame[flag], frame[score]),
+        }
+    method_root = {
+        "sain_local": "full_signal_sain_local_quantminer",
+        "imdisco_maximal": "full_signal_imdisco_maximal",
+    }.get(method, f"full_signal_{method}")
+    if method == "sain_local":
+        metrics_path = ROOT / f"scripts/out/{method_root}/{topology}/metrics.json"
+        if metrics_path.is_file():
+            document = json.loads(metrics_path.read_text())
+            status = document.get("status", "ok")
+            if status != "ok":
+                configured_width = (
+                    document.get("config", {}).get("quantminer", {})
+                    .get("max_attributes")
+                )
+                if (
+                    configured_width is not None
+                    and int(configured_width)
+                    != SAIN_QUANTMINER_CONFIG.max_attributes
+                ):
+                    return {"status": "pending"}
+                return {"status": status}
+    path = ROOT / f"scripts/out/{method_root}/{topology}/predictions.csv"
     if not path.is_file():
         unavailable = ROOT / f"scripts/out/full_signal_{method}/{topology}/metrics.json"
         if unavailable.is_file():
@@ -66,7 +114,8 @@ def baseline_one(method: str, topology: str) -> dict | None:
         predictions = frame["y_pred"]
     else:
         score_column = {"cusum": "cusum_score", "sain": "score",
-                        "sain_local": "score", "sicams": "moving_average"}[method]
+                        "sain_local": "score", "imdisco_maximal": "score",
+                        "sicams": "moving_average"}[method]
         scores = frame[score_column]
         predictions = frame["y_pred"]
     values = detection_metrics(frame["y_true"], predictions, scores)
@@ -74,9 +123,9 @@ def baseline_one(method: str, topology: str) -> dict | None:
 
 
 def baselines() -> str:
-    lines = [r"\begin{tabular}{llll}", r"\toprule",
+    lines = [r"\begin{tabular}{@{}llll@{}}", r"\toprule",
              r"Method & Anytown & C-Town & L-Town \\", r"\midrule"]
-    methods = ("cusum", "sain", "sain_local", "sicams", "imdisco", "hybrid", "conv")
+    methods = ("framework", "framework_obligations", "cusum", "sain", "sain_local", "sicams", "imdisco_maximal", "hybrid", "conv")
     results = {
         (method, topology): baseline_one(method, topology)
         for method in methods for topology in TOPOLOGIES
@@ -93,29 +142,43 @@ def baselines() -> str:
         }
     for method in methods:
         label = {
-            "cusum": "State-aware CUSUM",
-            "sain": "SAIN global (source-derived)",
-            "sain_local": "SAIN local (NiaARM)",
+            "framework": "Ours",
+            "framework_obligations": "O+O",
+            "cusum": "CUSUM",
+            "sain": "SAIN-G",
+            "sain_local": "SAIN-L",
             "sicams": "SICAMS",
             "imdisco": "IM-DISCO",
-            "hybrid": "Hybrid ensemble",
-            "conv": "ConvBiLSTM-AE",
+            "imdisco_maximal": "IMD-max",
+            "hybrid": "HE",
+            "conv": "CAE",
+        }[method]
+        citation = {
+            "framework": None,
+            "framework_obligations": None,
+            "cusum": "ghaeini2018state",
+            "sain": "abbas2024sain",
+            "sain_local": "abbas2024sain",
+            "sicams": "sicams2025",
+            "imdisco": "imdisco2024",
+            "imdisco_maximal": "imdisco2024",
+            "hybrid": "ahmed2025hybridensemblemethoddetecting",
+            "conv": "lee2024advancing",
         }[method]
         cells = []
         for topology in TOPOLOGIES:
             entry = results[(method, topology)]
             if entry["status"] != "ok":
-                cells.append(entry["status"])
+                cells.append(entry["status"].replace("_", r"\_"))
                 continue
             values = entry["metrics"]
             cells.append(
-                "\\shortstack[l]{"
-                f"MCC {fmt(values['mcc'], best=values['mcc'] == best[topology]['mcc'])}\\\\"
-                f"BA {fmt(values['balanced_accuracy'], best=values['balanced_accuracy'] == best[topology]['balanced_accuracy'])}\\\\"
-                f"AUPRC {fmt(values['aucpr'], best=values['aucpr'] == best[topology]['aucpr'])}"
-                "}"
+                f"{fmt_baseline(values['mcc'], best=values['mcc'] == best[topology]['mcc'])}/"
+                f"{fmt_baseline(values['balanced_accuracy'], best=values['balanced_accuracy'] == best[topology]['balanced_accuracy'])}/"
+                f"{fmt_baseline(values['aucpr'], best=values['aucpr'] == best[topology]['aucpr'])}"
             )
-        lines.append(f"{label} & {cells[0]} & {cells[1]} & {cells[2]} \\\\")
+        citation_text = "" if citation is None else f"~\\cite{{{citation}}}"
+        lines.append(f"{label}{citation_text} & {cells[0]} & {cells[1]} & {cells[2]} \\\\")
     lines.extend([r"\bottomrule", r"\end{tabular}"])
     return "\n".join(lines)
 
@@ -149,7 +212,7 @@ def main() -> int:
     result = (
         "% Generated by scripts/render_expansion_results.py; do not edit metrics manually.\n"
         "\\begin{table}[t]\n\\centering\n"
-        "\\caption{Expanded attack-corpus ablation. Counts are pooled over injection-window rows.}\n"
+        "\\caption{Expanded attack-corpus ablation. Counts pool held-out nominal rows and complete attack episodes; injection windows define positive labels. Arms: original GFSM (G), timing-correct GFSM (T), action obligations (O), original fusion (C), and obligation fusion (C+O).}\n"
         "\\label{tab:expanded_ablation}\n"
         f"{ablation()}\n\\end{{table}}\n\n"
         "\\begin{table}[tb]\n\\centering\n"
@@ -157,7 +220,7 @@ def main() -> int:
         "\\label{tab:tolerance_sweep}\n"
         f"{tolerance()}\n\\end{{table}}\n\n"
         "\\begin{table}[t]\n\\centering\n"
-        "\\caption{Full-signal baseline results. The best MCC, balanced accuracy (BA), and AUPRC are bolded per topology, including ties. Unavailable methods and pending runs are reported explicitly.}\n"
+        "\\caption{Full-signal baseline results (MCC/BA/AUPRC). Best values are bolded per topology, including ties. Ours and O+O are the original and obligation-aware fused detectors. SAIN-G/-L are global/local SAIN; ConvAE is ConvBiLSTM-AE; HE is the Hybrid Ensemble. Unavailable methods and pending runs are explicit.}\n"
         "\\label{tab:expanded_baselines}\n"
         f"{baselines()}\n\\end{{table}}\n"
     )

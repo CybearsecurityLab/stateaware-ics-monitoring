@@ -80,9 +80,18 @@ def analyze_topology(
             json.dumps(result.pdg_structured, indent=2, sort_keys=True) + "\n"
         )
 
-        pdg_nodes = sum(
-            len(g.get("nodes", [])) for g in result.pdg_structured.values()
-        )
+        components = result.pdg_structured.get("components")
+        if components is not None:
+            pdg_nodes = sum(
+                len(state.get("nodes", []))
+                for component in components
+                for state in component.get("states", [])
+            )
+        else:
+            pdg_nodes = sum(
+                len(graph.get("nodes", []))
+                for graph in result.pdg_structured.values()
+            )
         status = "ok"
         errors = list(result.errors)
         if fsms and pdg_nodes == 0 and result.ok:

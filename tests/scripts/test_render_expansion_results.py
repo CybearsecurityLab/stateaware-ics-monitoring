@@ -1,3 +1,5 @@
+import json
+
 from scripts import render_expansion_results as render
 
 
@@ -16,10 +18,47 @@ def test_baseline_bolding_is_per_topology_and_includes_ties(monkeypatch):
 
     monkeypatch.setattr(render, "baseline_one", fake_baseline)
     lines = render.baselines().splitlines()
-    cusum = next(line for line in lines if line.startswith("State-aware CUSUM"))
+    cusum = next(line for line in lines if line.startswith("CUSUM"))
     sicams = next(line for line in lines if line.startswith("SICAMS"))
-    conv = next(line for line in lines if line.startswith("ConvBiLSTM-AE"))
-    assert "MCC \\textbf{0.9000}" in cusum
-    assert "MCC \\textbf{0.9000}" in sicams
-    assert "BA \\textbf{0.8000}" in sicams
-    assert "AUPRC \\textbf{0.7000}" in conv
+    conv = next(line for line in lines if line.startswith("CAE"))
+    assert "\\textbf{0.900}" in cusum
+    assert "\\textbf{0.900}" in sicams
+    assert "\\textbf{0.800}" in sicams
+    assert "\\textbf{0.700}" in conv
+    assert "\\cite{ghaeini2018state}" in cusum
+    assert "\\cite{sicams2025}" in sicams
+    assert "\\cite{lee2024advancing}" in conv
+    framework = next(line for line in lines if line.startswith("Ours"))
+    assert "\\cite" not in framework
+    assert "\\shortstack" not in cusum
+    assert not any(line.startswith("IM-DISCO") for line in lines)
+    assert any(line.startswith("IMD-max") for line in lines)
+
+
+def test_historical_quantminer_failure_is_pending_for_corrected_run(
+    tmp_path, monkeypatch,
+):
+    output = tmp_path / "scripts/out/full_signal_sain_local_quantminer/ctown"
+    output.mkdir(parents=True)
+    (output / "metrics.json").write_text(json.dumps({
+        "status": "mining_errors",
+        "config": {"quantminer": {"max_attributes": 3}},
+    }))
+    (output / "predictions.csv").write_text("y_true,y_pred,score\n0,0,0\n")
+    monkeypatch.setattr(render, "ROOT", tmp_path)
+
+    assert render.baseline_one("sain_local", "ctown") == {"status": "pending"}
+
+
+def test_current_quantminer_failure_is_not_relabelled(tmp_path, monkeypatch):
+    output = tmp_path / "scripts/out/full_signal_sain_local_quantminer/ctown"
+    output.mkdir(parents=True)
+    (output / "metrics.json").write_text(json.dumps({
+        "status": "mining_errors",
+        "config": {"quantminer": {
+            "max_attributes": render.SAIN_QUANTMINER_CONFIG.max_attributes,
+        }},
+    }))
+    monkeypatch.setattr(render, "ROOT", tmp_path)
+
+    assert render.baseline_one("sain_local", "ctown") == {"status": "mining_errors"}
