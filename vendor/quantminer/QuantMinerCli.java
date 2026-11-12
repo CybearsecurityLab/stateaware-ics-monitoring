@@ -1,6 +1,7 @@
 import src.apriori.AssociationRule;
 import src.database.DatabaseAdmin;
 import src.geneticAlgorithm.OptimizerGeneticAlgo;
+import src.solver.QuantMinerGpuSupportCounts;
 import src.solver.ResolutionContext;
 import src.solver.RuleTester;
 
@@ -19,6 +20,8 @@ public final class QuantMinerCli {
         int population = args.length > 4 ? Integer.parseInt(args[4]) : 250;
         int generations = args.length > 5 ? Integer.parseInt(args[5]) : 100;
         int maxAttributes = args.length > 6 ? Integer.parseInt(args[6]) : 3;
+
+        QuantMinerGpuSupportCounts.initializeIfRequested();
 
         DatabaseAdmin database = new DatabaseAdmin(input, "csv");
         if (!database.EstBaseDeDonneesValide()) {
