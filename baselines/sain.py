@@ -375,6 +375,99 @@ def _mine_component(
     return model, all_ok
 
 
+def _quantminer_state(
+    *,
+    plc: str,
+    case_var: str,
+    column: str,
+    state_id: str,
+    state_df: pd.DataFrame,
+    feature_cols: list[str],
+    cfg: QuantMinerConfig,
+    min_observations: int,
+    artifact_dir: Path,
+) -> tuple[dict[str, Any], bool]:
+    """Mine one independent component state without changing Java semantics."""
+    component_key = f"{plc}.{case_var}"
+    nobs = int(len(state_df))
+    if nobs < min_observations:
+        return {
+            "observations": nobs,
+            "status": "insufficient_data",
+            "rule_count": 0,
+            "rules": [],
+        }, True
+    mining_columns = [
+        column for column in feature_cols
+        if state_df[column].max() > state_df[column].min()
+    ]
+    removed_constant = [
+        column for column in feature_cols if column not in mining_columns
+    ]
+    constant_rules = []
+    for column in removed_constant:
+        value = float(state_df[column].iloc[0])
+        if not np.isfinite(value):
+            raise InvariantsError(
+                f"cannot build a point invariant for {component_key} state "
+                f"{state_id} column {column}: missing or nonfinite value"
+            )
+        constant_rules.append(MinedRule(
+            id=f"state-local-constant-{component_key}-{state_id}-{column}",
+            antecedent=[],
+            consequent=[Atom(col=column, op="in", val=[value, value])],
+            support=1.0,
+            confidence=1.0,
+        ))
+    safe_state = re.sub(r"[^A-Za-z0-9_.-]+", "_", state_id)
+    state_digest = hashlib.sha256(state_id.encode("utf-8")).hexdigest()[:12]
+    state_dir = Path(artifact_dir) / f"state_{safe_state}_{state_digest}"
+    if not mining_columns:
+        return {
+            "observations": nobs,
+            "status": "constant_only",
+            "mining_feature_columns": [],
+            "removed_constant_columns": removed_constant,
+            "constant_invariant_count": len(constant_rules),
+            "rule_count": len(constant_rules),
+            "official_rule_count": 0,
+            "rules": [rule.to_dict() for rule in constant_rules],
+        }, True
+    try:
+        result = run_quantminer(
+            state_df.loc[:, mining_columns], state_dir, cfg,
+        )
+        official_rules = parse_quantminer_rules(result["rules_path"])
+        official_count = int(result["provenance"]["rule_count"])
+        if official_count != len(official_rules):
+            raise QuantMinerRuleError(
+                f"QuantMiner rule count mismatch for {component_key} state "
+                f"{state_id}: provenance={official_count}, parsed={len(official_rules)}"
+            )
+        rules = [*constant_rules, *official_rules]
+        return {
+            "observations": nobs,
+            "status": "ok",
+            "mining_feature_columns": mining_columns,
+            "removed_constant_columns": removed_constant,
+            "constant_invariant_count": len(constant_rules),
+            "rule_count": len(rules),
+            "official_rule_count": official_count,
+            "rules_path": str(result["rules_path"]),
+            "quantminer_provenance": result["provenance"],
+            "rules": [rule.to_dict() for rule in rules],
+        }, True
+    except Exception as exc:  # noqa: BLE001 - mining is best-effort
+        return {
+            "observations": nobs,
+            "status": "mining_error",
+            "rule_count": 0,
+            "errors": [repr(exc)],
+            "artifact_dir": str(state_dir),
+            "rules": [],
+        }, False
+
+
 def _quantminer_component(
     *,
     plc: str,
@@ -392,89 +485,21 @@ def _quantminer_component(
     ids = local_state_ids(train_df, column)
     all_ok = True
     for state_id in sorted(set(ids.tolist())):
-        slice_df = train_df.loc[ids == state_id]
-        nobs = int(len(slice_df))
-        if nobs < min_observations:
-            model.states[state_id] = {
-                "observations": nobs,
-                "status": "insufficient_data",
-                "rule_count": 0,
-                "rules": [],
-            }
-            continue
-        mining_columns = [
-            column for column in feature_cols
-            if slice_df[column].max() > slice_df[column].min()
-        ]
-        removed_constant = [
-            column for column in feature_cols if column not in mining_columns
-        ]
-        constant_rules = []
-        for column in removed_constant:
-            value = float(slice_df[column].iloc[0])
-            if not np.isfinite(value):
-                raise InvariantsError(
-                    f"cannot build a point invariant for {model.key} state "
-                    f"{state_id} column {column}: missing or nonfinite value"
-                )
-            constant_rules.append(MinedRule(
-                id=f"state-local-constant-{model.key}-{state_id}-{column}",
-                antecedent=[],
-                consequent=[Atom(col=column, op="in", val=[value, value])],
-                support=1.0,
-                confidence=1.0,
-            ))
-        safe_state = re.sub(r"[^A-Za-z0-9_.-]+", "_", state_id)
-        state_digest = hashlib.sha256(state_id.encode("utf-8")).hexdigest()[:12]
-        state_dir = Path(artifact_dir) / f"state_{safe_state}_{state_digest}"
-        if not mining_columns:
-            model.states[state_id] = {
-                "observations": nobs,
-                "status": "constant_only",
-                "mining_feature_columns": [],
-                "removed_constant_columns": removed_constant,
-                "constant_invariant_count": len(constant_rules),
-                "rule_count": len(constant_rules),
-                "official_rule_count": 0,
-                "rules": [rule.to_dict() for rule in constant_rules],
-            }
-            continue
-        try:
-            result = run_quantminer(
-                slice_df.loc[:, mining_columns], state_dir, cfg,
-            )
-            official_rules = parse_quantminer_rules(result["rules_path"])
-            official_count = int(result["provenance"]["rule_count"])
-            if official_count != len(official_rules):
-                raise QuantMinerRuleError(
-                    f"QuantMiner rule count mismatch for {model.key} state "
-                    f"{state_id}: provenance={official_count}, parsed={len(official_rules)}"
-                )
-            rules = [*constant_rules, *official_rules]
-            model.states[state_id] = {
-                "observations": nobs,
-                "status": "ok",
-                "mining_feature_columns": mining_columns,
-                "removed_constant_columns": removed_constant,
-                "constant_invariant_count": len(constant_rules),
-                "rule_count": len(rules),
-                "official_rule_count": official_count,
-                "rules_path": str(result["rules_path"]),
-                "quantminer_provenance": result["provenance"],
-                "rules": [rule.to_dict() for rule in rules],
-            }
-        except Exception as exc:  # noqa: BLE001 - mining is best-effort
-            all_ok = False
-            model.states[state_id] = {
-                "observations": nobs,
-                "status": "mining_error",
-                "rule_count": 0,
-                "errors": [repr(exc)],
-                "artifact_dir": str(state_dir),
-                "rules": [],
-            }
-            if not keep_going:
-                break
+        entry, state_ok = _quantminer_state(
+            plc=plc,
+            case_var=case_var,
+            column=column,
+            state_id=state_id,
+            state_df=train_df.loc[ids == state_id],
+            feature_cols=feature_cols,
+            cfg=cfg,
+            min_observations=min_observations,
+            artifact_dir=artifact_dir,
+        )
+        model.states[state_id] = entry
+        all_ok = all_ok and state_ok
+        if not state_ok and not keep_going:
+            break
     return model, all_ok
 
 
@@ -603,7 +628,44 @@ def mine_local_invariants(
                 / f"{index:03d}_{safe_key}_{key_digest}"
             )
         jobs.append(job)
-    if n_jobs == 1:
+    state_parallel = engine == "quantminer" and n_jobs > 1 and keep_going
+    if state_parallel:
+        for job in jobs:
+            model = _ComponentModel(
+                plc=job["plc"], case_var=job["case_var"], column=job["column"],
+            )
+            models[model.key] = model
+        state_jobs = []
+        for job in jobs:
+            ids = local_state_ids(job["train_df"], job["column"])
+            for state_id in sorted(set(ids.tolist())):
+                state_jobs.append((
+                    f"{job['plc']}.{job['case_var']}",
+                    dict(
+                        plc=job["plc"],
+                        case_var=job["case_var"],
+                        column=job["column"],
+                        state_id=state_id,
+                        state_df=job["train_df"].loc[ids == state_id],
+                        feature_cols=job["feature_cols"],
+                        cfg=job["cfg"],
+                        min_observations=job["min_observations"],
+                        artifact_dir=job["artifact_dir"],
+                    ),
+                ))
+        with ProcessPoolExecutor(max_workers=n_jobs) as pool:
+            futures = [
+                (key, state_job["state_id"], pool.submit(
+                    _quantminer_state, **state_job,
+                ))
+                for key, state_job in state_jobs
+            ]
+            for key, state_id, future in futures:
+                entry, state_ok = future.result()
+                models[key].states[state_id] = entry
+                all_ok = all_ok and state_ok
+        results = []
+    elif n_jobs == 1:
         results = [worker(**job) for job in jobs]
     else:
         with ProcessPoolExecutor(max_workers=n_jobs) as pool:
@@ -666,6 +728,7 @@ def mine_local_invariants(
                 "no random-seed control"
             ),
             "n_jobs": int(n_jobs),
+            "parallel_granularity": "state" if state_parallel else "component",
             "artifact_root": str(quantminer_dir),
             "rule_count": sum(
                 len(state.get("rules") or [])

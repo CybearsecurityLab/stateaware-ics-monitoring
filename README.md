@@ -120,6 +120,8 @@ Local SAIN has two separately preserved engines:
 
 The three-attribute QuantMiner attempt exposed upstream 32-bit factorial overflow. Exact BigInteger combinatorics fix that overflow. Where upstream arithmetic is already valid, the correction preserves combinations, support, confidence and rule semantics; it does not establish full-width equivalence or tractability. Exact state-local constant channels are excluded from QuantMiner input as static variables but retained as separately recorded point-interval invariants. Every nonconstant observable feature is retained, and all constants are named. Failed three-attribute artifacts are under `scripts/out/full_signal_sain_local_quantminer_three_attribute/`; the reduced-width runs use `scripts/out/full_signal_sain_local_quantminer/`.
 
+For QuantMiner, `--jobs N` schedules independent `(component, state)` mining tasks across N processes. Each Java process runs the unchanged single-threaded official engine; the scheduler preserves inputs, configuration, artifact paths and deterministic result ordering. State-parallel validation artifacts are under `scripts/out/full_signal_sain_local_quantminer_state_parallel/`. QuantMiner has no GPU backend, so a GPU version would require a separate parity-checked implementation.
+
 Neither local engine reproduces SAIN's original execution configuration or SMONITOR.
 
 ## Expanded evaluation

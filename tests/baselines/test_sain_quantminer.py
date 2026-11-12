@@ -211,6 +211,78 @@ def test_state_local_constants_are_excluded_with_provenance(tmp_path, monkeypatc
     assert rule["consequent"] == [{"col": "static", "op": "in", "val": [7.0, 7.0]}]
 
 
+def test_quantminer_state_parallel_matches_sequential_model(tmp_path, monkeypatch):
+    def fake_quantminer(frame, out_dir, config):
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        rules_path = out_dir / "rules.csv"
+        frame.to_csv(out_dir / "training.csv", index=False)
+        _write_rules(rules_path, [_row("x in [0; 10]", "z in [0; 5]")])
+        provenance = {
+            "implementation": "official_vendored_quantminer_java",
+            "upstream_commit": QUANTMINER_CODE_COMMIT,
+            "config": config.__dict__,
+            "rule_count": 1,
+        }
+        return {"rules_path": rules_path, "provenance": provenance}
+
+    class ImmediateFuture:
+        def __init__(self, value):
+            self.value = value
+
+        def result(self):
+            return self.value
+
+    class ImmediatePool:
+        def __init__(self, max_workers):
+            assert max_workers == 2
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def submit(self, function, **kwargs):
+            return ImmediateFuture(function(**kwargs))
+
+    monkeypatch.setattr("baselines.sain.run_quantminer", fake_quantminer)
+    monkeypatch.setattr("baselines.sain.ProcessPoolExecutor", ImmediatePool)
+    train = pd.DataFrame({
+        "p1": [0, 0, 1, 1],
+        "x": [1.0, 2.0, 3.0, 4.0],
+        "z": [1.0] * 4,
+    })
+
+    def mine(n_jobs, artifact_name):
+        return mine_local_invariants(
+            topology="synthetic",
+            components=[("PLC1", "S")],
+            fb_to_col={("PLC1", "S"): "p1"},
+            training_frames=[train],
+            validation_frames=[train],
+            feature_cols=["x", "z"],
+            min_observations=2,
+            engine="quantminer",
+            quantminer_dir=tmp_path / artifact_name,
+            n_jobs=n_jobs,
+        )
+
+    sequential = mine(1, "sequential")
+    parallel = mine(2, "parallel")
+    assert parallel["quantminer"]["parallel_granularity"] == "state"
+    sequential_states = sequential["components"]["PLC1.S"]["local_states"]
+    parallel_states = parallel["components"]["PLC1.S"]["local_states"]
+    assert set(parallel_states) == {"0", "1"}
+    for state_id in ("0", "1"):
+        sequential_entry = dict(sequential_states[state_id])
+        parallel_entry = dict(parallel_states[state_id])
+        sequential_entry.pop("rules_path")
+        parallel_entry.pop("rules_path")
+        assert parallel_entry == sequential_entry
+    assert len(list((tmp_path / "parallel").rglob("training.csv"))) == 2
+
+
 def test_quantminer_engine_requires_independent_artifact_directory():
     frame = pd.DataFrame({"p1": [0], "x": [1.0]})
     with pytest.raises(ValueError, match="quantminer_dir"):
