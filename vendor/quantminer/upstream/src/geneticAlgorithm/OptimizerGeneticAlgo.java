@@ -37,7 +37,7 @@ public class OptimizerGeneticAlgo extends RuleOptimizer {
     // METTRE CETTE VARIABLE A VRAI POUR AFFICHER UN GRAPHE D'EVOLUTION DE LA QUALITE APRES L'OPTIMISATION D'UNE REGLE :
     static boolean m_bAfficherGrapheQualite = false;
     
-    static boolean m_bSortirQualite = true;
+    static boolean m_bSortirQualite = Boolean.getBoolean("quantminer.quality.summary");
     
     static int m_iRules=0;
     

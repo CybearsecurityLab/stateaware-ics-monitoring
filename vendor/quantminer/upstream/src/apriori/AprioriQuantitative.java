@@ -182,6 +182,20 @@ public class AprioriQuantitative {
    
     
     
+    private static BigInteger[] factorialCache = {BigInteger.ONE, BigInteger.ONE};
+
+    private static synchronized BigInteger factorial(int value) {
+        if (value < 0)
+            throw new IllegalArgumentException("factorial of a negative value");
+        if (value >= factorialCache.length) {
+            int previousLength = factorialCache.length;
+            factorialCache = Arrays.copyOf(factorialCache, value + 1);
+            for (int index = previousLength; index <= value; index++)
+                factorialCache[index] = factorialCache[index - 1].multiply(BigInteger.valueOf(index));
+        }
+        return factorialCache[value];
+    }
+
     // Calcule tous les ensembles d'items possibles, chaque ensemble �tant constitu� de 'iNombrePlaces' �l�ments
     // (renvoie un tableau indiquant la pr�sence ou non du i-�me item dans l'ensemble) :
     /**
@@ -196,9 +210,8 @@ public class AprioriQuantitative {
         int iIndiceItem = 0;
         int iNombreItemsRestants = 0;
         int iNombrePlacesRestantes = 0;
-        int iCompteur = 0;
         // Exact combinatorics avoid 32-bit factorial overflow on wide inputs.
-        BigInteger factN = BigInteger.ZERO, factP = BigInteger.ZERO, factN_P = BigInteger.ZERO, iCNP = BigInteger.ZERO;
+        BigInteger factN, factP, factN_P, iCNP;
         
         if (iNombreItems==0) return null;
  
@@ -212,17 +225,9 @@ public class AprioriQuantitative {
             
             if (iNombreItemsRestants>iNombrePlacesRestantes) {
 
-                factN = factP = factN_P = BigInteger.ONE;
-
-                for (iCompteur=2;iCompteur<iNombreItemsRestants;iCompteur++)
-                    factN = factN.multiply(BigInteger.valueOf(iCompteur));
-
-                for (iCompteur=2;iCompteur<iNombrePlacesRestantes;iCompteur++)
-                    factP = factP.multiply(BigInteger.valueOf(iCompteur));
-
-                for (iCompteur=2;iCompteur<=(iNombreItemsRestants-iNombrePlacesRestantes);iCompteur++)
-                    factN_P = factN_P.multiply(BigInteger.valueOf(iCompteur));
-
+                factN = factorial(iNombreItemsRestants - 1);
+                factP = factorial(iNombrePlacesRestantes - 1);
+                factN_P = factorial(iNombreItemsRestants - iNombrePlacesRestantes);
                 iCNP = factN.divide(factP.multiply(factN_P));
 
             }

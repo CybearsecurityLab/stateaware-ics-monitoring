@@ -16,4 +16,4 @@ This package contains the upstream Java sources (`upstream/src`), upstream `buil
 
 The Python adapter can schedule independent component-state runs across multiple processes. Each process invokes the same single-threaded Java engine with identical inputs and configuration; this scheduling adaptation does not parallelize or modify the Java algorithm itself.
 
-An opt-in HIP/JNI support-count prototype is under `gpu/`. It passes randomized support-count and Anytown rule-level parity checks, but synchronous transfers and small kernel launches make it approximately three times slower end-to-end. It is disabled by default and is not used for evaluation results.
+An opt-in HIP/JNI support-count prototype is under `gpu/`. It passes randomized support-count and Anytown rule-level parity checks. Row-parallel reduction and transfer optimizations make it approximately 1.9–2.0× faster than the original CPU in controlled Anytown benchmarks. It is disabled by default; full C-Town/L-Town results are recorded separately when available.

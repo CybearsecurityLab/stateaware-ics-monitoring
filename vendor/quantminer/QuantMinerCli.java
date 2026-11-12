@@ -47,5 +47,6 @@ public final class QuantMinerCli {
         AssociationRule[] rules = (AssociationRule[]) tester.ObtenirListeReglesOptimales().toArray(new AssociationRule[0]);
         context.SauvegarderReglesCsv(output, rules);
         System.out.println("rules=" + rules.length);
+        QuantMinerGpuSupportCounts.dumpProfile();
     }
 }

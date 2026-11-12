@@ -212,6 +212,8 @@ def test_state_local_constants_are_excluded_with_provenance(tmp_path, monkeypatc
 
 
 def test_quantminer_state_parallel_matches_sequential_model(tmp_path, monkeypatch):
+    submitted_states = []
+
     def fake_quantminer(frame, out_dir, config):
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -244,14 +246,15 @@ def test_quantminer_state_parallel_matches_sequential_model(tmp_path, monkeypatc
             return False
 
         def submit(self, function, **kwargs):
+            submitted_states.append(kwargs["state_id"])
             return ImmediateFuture(function(**kwargs))
 
     monkeypatch.setattr("baselines.sain.run_quantminer", fake_quantminer)
     monkeypatch.setattr("baselines.sain.ProcessPoolExecutor", ImmediatePool)
     train = pd.DataFrame({
-        "p1": [0, 0, 1, 1],
-        "x": [1.0, 2.0, 3.0, 4.0],
-        "z": [1.0] * 4,
+        "p1": [0, 0, 1, 1, 1, 1],
+        "x": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        "z": [1.0] * 6,
     })
 
     def mine(n_jobs, artifact_name):
@@ -271,6 +274,10 @@ def test_quantminer_state_parallel_matches_sequential_model(tmp_path, monkeypatc
     sequential = mine(1, "sequential")
     parallel = mine(2, "parallel")
     assert parallel["quantminer"]["parallel_granularity"] == "state"
+    assert parallel["quantminer"]["scheduling_policy"] == (
+        "descending_state_rows_times_feature_count_squared"
+    )
+    assert submitted_states == ["1", "0"]
     sequential_states = sequential["components"]["PLC1.S"]["local_states"]
     parallel_states = parallel["components"]["PLC1.S"]["local_states"]
     assert set(parallel_states) == {"0", "1"}

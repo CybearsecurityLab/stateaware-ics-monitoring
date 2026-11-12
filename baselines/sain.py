@@ -653,6 +653,10 @@ def mine_local_invariants(
                         artifact_dir=job["artifact_dir"],
                     ),
                 ))
+        state_jobs.sort(
+            key=lambda item: -len(item[1]["state_df"])
+            * len(item[1]["feature_cols"]) ** 2
+        )
         with ProcessPoolExecutor(max_workers=n_jobs) as pool:
             futures = [
                 (key, state_job["state_id"], pool.submit(
@@ -729,6 +733,10 @@ def mine_local_invariants(
             ),
             "n_jobs": int(n_jobs),
             "parallel_granularity": "state" if state_parallel else "component",
+            "scheduling_policy": (
+                "descending_state_rows_times_feature_count_squared"
+                if state_parallel else "component_input_order"
+            ),
             "artifact_root": str(quantminer_dir),
             "rule_count": sum(
                 len(state.get("rules") or [])

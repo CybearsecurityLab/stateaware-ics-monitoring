@@ -1,27 +1,107 @@
 #include <hip/hip_runtime.h>
 #include <jni.h>
 
+#include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <mutex>
 #include <sstream>
-#include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace {
 
-struct DeviceContext {
+constexpr int kThreadsPerBlock = 256;
+using Clock = std::chrono::steady_clock;
+
+struct ProfileCounters {
+    std::uint64_t contexts = 0;
+    std::uint64_t evaluations = 0;
+    std::uint64_t nativeContextNs = 0;
+    std::uint64_t jniTotalNs = 0;
+    std::uint64_t allocationNs = 0;
+    std::uint64_t h2dNs = 0;
+    std::uint64_t kernelNs = 0;
+    std::uint64_t d2hNs = 0;
+    std::uint64_t candidateTotal = 0;
+    std::uint64_t activeRowTotal = 0;
+    std::uint64_t coverageUploads = 0;
+    std::uint64_t coverageCacheHits = 0;
+    int candidateMin = std::numeric_limits<int>::max();
+    int candidateMax = 0;
+    int activeRowMin = std::numeric_limits<int>::max();
+    int activeRowMax = 0;
+};
+
+bool gProfiling = false;
+ProfileCounters gProfile;
+
+struct DeviceBuffers {
     float* values = nullptr;
+    std::size_t valueCapacity = 0;
     int* activeRows = nullptr;
+    std::size_t activeRowCapacity = 0;
     std::uint8_t* rightEligible = nullptr;
     std::uint8_t* leftCovered = nullptr;
     std::uint8_t* rightCovered = nullptr;
-    float* lowerBounds = nullptr;
-    float* upperBounds = nullptr;
+    std::size_t rightEligibleCapacity = 0;
+    std::size_t leftCoverageCapacity = 0;
+    std::size_t rightCoverageCapacity = 0;
+    float* packedBounds = nullptr;
+    std::size_t boundCapacity = 0;
     int* supports = nullptr;
-    int candidateCapacity = 0;
+    std::size_t supportCapacity = 0;
+
+    std::vector<float> hostValues;
+    std::vector<jint> hostActiveRows;
+    std::vector<jbyte> hostRightEligible;
+    std::vector<float> hostPackedBounds;
+    std::vector<jint> hostSupports;
+    std::vector<jbyte> hostLeftCovered;
+    std::vector<jbyte> hostRightCovered;
+    std::vector<jbyte> coverageScratch;
+    bool leftCoverageValid = false;
+    bool rightCoverageValid = false;
+
+    hipEvent_t kernelStart = nullptr;
+    hipEvent_t kernelStop = nullptr;
+};
+
+struct DeviceContext {
+    DeviceBuffers* buffers = nullptr;
     int rowCount = 0;
     int dimensions = 0;
     int activeRowCount = 0;
+};
+
+std::mutex gBufferPoolMutex;
+std::vector<DeviceBuffers*> gBufferPool;
+
+Clock::time_point timerStart() {
+    return gProfiling ? Clock::now() : Clock::time_point();
+}
+
+std::uint64_t timerElapsed(Clock::time_point start) {
+    if (!gProfiling)
+        return 0;
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
+}
+
+class ScopedTimer {
+public:
+    explicit ScopedTimer(std::uint64_t& destination)
+        : destination_(destination), start_(timerStart()) {}
+    ~ScopedTimer() { destination_ += timerElapsed(start_); }
+
+private:
+    std::uint64_t& destination_;
+    Clock::time_point start_;
 };
 
 void throwJava(JNIEnv* env, const char* className, const std::string& message) {
@@ -39,66 +119,113 @@ void checkHip(JNIEnv* env, hipError_t status, const char* operation) {
     throwJava(env, "java/lang/IllegalStateException", message.str());
 }
 
+DeviceBuffers* acquireBuffers() {
+    std::lock_guard<std::mutex> lock(gBufferPoolMutex);
+    if (!gBufferPool.empty()) {
+        DeviceBuffers* buffers = gBufferPool.back();
+        gBufferPool.pop_back();
+        buffers->leftCoverageValid = false;
+        buffers->rightCoverageValid = false;
+        return buffers;
+    }
+    return new DeviceBuffers();
+}
+
+void releaseBuffers(DeviceBuffers* buffers) {
+    std::lock_guard<std::mutex> lock(gBufferPoolMutex);
+    gBufferPool.push_back(buffers);
+}
+
 template <typename T>
-void upload(JNIEnv* env, T** destination, const T* source, std::size_t count,
-            const char* operation) {
-    if (count == 0)
-        return;
-    checkHip(env, hipMalloc(reinterpret_cast<void**>(destination), count * sizeof(T)),
-             "HIP device allocation");
-    if (env->ExceptionCheck())
-        return;
-    checkHip(env, hipMemcpy(*destination, source, count * sizeof(T), hipMemcpyHostToDevice),
-             operation);
-}
-
-void freeContext(DeviceContext* context) {
-    if (context == nullptr)
-        return;
-    hipFree(context->values);
-    hipFree(context->activeRows);
-    hipFree(context->rightEligible);
-    hipFree(context->leftCovered);
-    hipFree(context->rightCovered);
-    hipFree(context->lowerBounds);
-    hipFree(context->upperBounds);
-    hipFree(context->supports);
-    delete context;
-}
-
-bool ensurePopulationCapacity(JNIEnv* env, DeviceContext* context, int candidateCount) {
-    if (candidateCount <= context->candidateCapacity)
+bool ensureCapacity(JNIEnv* env, T** pointer, std::size_t& capacity,
+                    std::size_t required, const char* operation) {
+    if (required <= capacity && (*pointer != nullptr || required == 0))
         return true;
 
-    float* lowerBounds = nullptr;
-    float* upperBounds = nullptr;
-    int* supports = nullptr;
-    const std::size_t boundCount = static_cast<std::size_t>(candidateCount) * context->dimensions;
-    checkHip(env, hipMalloc(reinterpret_cast<void**>(&lowerBounds), boundCount * sizeof(float)),
-             "HIP lower-bound allocation");
-    if (env->ExceptionCheck()) goto cleanup;
-    checkHip(env, hipMalloc(reinterpret_cast<void**>(&upperBounds), boundCount * sizeof(float)),
-             "HIP upper-bound allocation");
-    if (env->ExceptionCheck()) goto cleanup;
-    checkHip(env, hipMalloc(reinterpret_cast<void**>(&supports),
-                            static_cast<std::size_t>(candidateCount) * 2 * sizeof(int)),
-             "HIP support-count allocation");
-    if (env->ExceptionCheck()) goto cleanup;
+    T* replacement = nullptr;
+    Clock::time_point allocationStart = timerStart();
+    hipError_t status = hipMalloc(reinterpret_cast<void**>(&replacement), required * sizeof(T));
+    gProfile.allocationNs += timerElapsed(allocationStart);
+    checkHip(env, status, operation);
+    if (env->ExceptionCheck())
+        return false;
 
-    hipFree(context->lowerBounds);
-    hipFree(context->upperBounds);
-    hipFree(context->supports);
-    context->lowerBounds = lowerBounds;
-    context->upperBounds = upperBounds;
-    context->supports = supports;
-    context->candidateCapacity = candidateCount;
+    if (*pointer != nullptr) {
+        allocationStart = timerStart();
+        status = hipFree(*pointer);
+        gProfile.allocationNs += timerElapsed(allocationStart);
+        checkHip(env, status, "HIP device-buffer release");
+        if (env->ExceptionCheck()) {
+            hipFree(replacement);
+            return false;
+        }
+    }
+
+    *pointer = replacement;
+    capacity = required;
     return true;
+}
 
-cleanup:
-    hipFree(lowerBounds);
-    hipFree(upperBounds);
-    hipFree(supports);
-    return false;
+bool ensureEvents(JNIEnv* env, DeviceBuffers* buffers) {
+    if (!gProfiling || buffers->kernelStart != nullptr)
+        return true;
+    Clock::time_point allocationStart = timerStart();
+    hipError_t status = hipEventCreate(&buffers->kernelStart);
+    gProfile.allocationNs += timerElapsed(allocationStart);
+    checkHip(env, status, "HIP profiling-event creation");
+    if (env->ExceptionCheck())
+        return false;
+
+    allocationStart = timerStart();
+    status = hipEventCreate(&buffers->kernelStop);
+    gProfile.allocationNs += timerElapsed(allocationStart);
+    checkHip(env, status, "HIP profiling-event creation");
+    return !env->ExceptionCheck();
+}
+
+void h2d(JNIEnv* env, void* destination, const void* source, std::size_t bytes,
+         const char* operation) {
+    if (bytes == 0)
+        return;
+    Clock::time_point start = timerStart();
+    hipError_t status = hipMemcpy(destination, source, bytes, hipMemcpyHostToDevice);
+    gProfile.h2dNs += timerElapsed(start);
+    checkHip(env, status, operation);
+}
+
+void uploadCoverage(JNIEnv* env, DeviceContext* context, jbyteArray javaCoverage,
+                    bool leftSide) {
+    DeviceBuffers* buffers = context->buffers;
+    if (context->rowCount == 0)
+        return;
+
+    buffers->coverageScratch.resize(context->rowCount);
+    env->GetByteArrayRegion(javaCoverage, 0, context->rowCount,
+                            buffers->coverageScratch.data());
+    if (env->ExceptionCheck())
+        return;
+
+    std::vector<jbyte>& cached = leftSide
+        ? buffers->hostLeftCovered : buffers->hostRightCovered;
+    bool& valid = leftSide ? buffers->leftCoverageValid : buffers->rightCoverageValid;
+    if (valid && cached.size() == buffers->coverageScratch.size()
+        && std::memcmp(cached.data(), buffers->coverageScratch.data(),
+                       buffers->coverageScratch.size()) == 0) {
+        if (gProfiling)
+            ++gProfile.coverageCacheHits;
+        return;
+    }
+
+    std::uint8_t* destination = leftSide
+        ? buffers->leftCovered : buffers->rightCovered;
+    h2d(env, destination, buffers->coverageScratch.data(), context->rowCount,
+        leftSide ? "HIP left-coverage upload" : "HIP right-coverage upload");
+    if (env->ExceptionCheck())
+        return;
+    cached = buffers->coverageScratch;
+    valid = true;
+    if (gProfiling)
+        ++gProfile.coverageUploads;
 }
 
 __global__ void countSupportsKernel(
@@ -107,35 +234,30 @@ __global__ void countSupportsKernel(
     const std::uint8_t* __restrict__ rightEligible,
     const std::uint8_t* __restrict__ leftCovered,
     const std::uint8_t* __restrict__ rightCovered,
-    const float* __restrict__ lowerBounds,
-    const float* __restrict__ upperBounds,
+    const float* __restrict__ packedBounds,
     int rowCount,
     int activeRowCount,
     int dimensions,
-    int candidateCount,
     int leftDimensions,
     bool evaluateLeft,
     bool evaluateRight,
-    int* __restrict__ conditionSupports,
-    int* __restrict__ ruleSupports) {
-    int candidate = blockIdx.x * blockDim.x + threadIdx.x;
-    if (candidate >= candidateCount)
-        return;
-
+    int* __restrict__ supports) {
+    const int candidate = blockIdx.x;
+    const int lane = threadIdx.x;
+    const float* candidateBounds = packedBounds + candidate * dimensions * 2;
     int conditionSupport = 0;
     int ruleSupport = 0;
-    const float* candidateLower = lowerBounds + candidate * dimensions;
-    const float* candidateUpper = upperBounds + candidate * dimensions;
 
-    for (int activeIndex = 0; activeIndex < activeRowCount; ++activeIndex) {
-        int row = activeRows[activeIndex];
+    for (int activeIndex = lane; activeIndex < activeRowCount;
+         activeIndex += kThreadsPerBlock) {
+        const int row = activeRows[activeIndex];
         bool conditionCovered = true;
 
         if (evaluateLeft) {
             for (int dimension = 0; dimension < leftDimensions; ++dimension) {
-                float value = values[dimension * rowCount + row];
-                conditionCovered = value >= candidateLower[dimension]
-                    && value <= candidateUpper[dimension];
+                const float value = values[dimension * rowCount + row];
+                conditionCovered = value >= candidateBounds[dimension * 2]
+                    && value <= candidateBounds[dimension * 2 + 1];
                 if (!conditionCovered)
                     break;
             }
@@ -153,9 +275,9 @@ __global__ void countSupportsKernel(
             ruleCovered = rightEligible[row] != 0;
             for (int dimension = leftDimensions;
                  ruleCovered && dimension < dimensions; ++dimension) {
-                float value = values[dimension * rowCount + row];
-                ruleCovered = value >= candidateLower[dimension]
-                    && value <= candidateUpper[dimension];
+                const float value = values[dimension * rowCount + row];
+                ruleCovered = value >= candidateBounds[dimension * 2]
+                    && value <= candidateBounds[dimension * 2 + 1];
             }
         }
         else {
@@ -166,8 +288,36 @@ __global__ void countSupportsKernel(
             ++ruleSupport;
     }
 
-    conditionSupports[candidate] = conditionSupport;
-    ruleSupports[candidate] = ruleSupport;
+    __shared__ int conditionReduction[kThreadsPerBlock];
+    __shared__ int ruleReduction[kThreadsPerBlock];
+    conditionReduction[lane] = conditionSupport;
+    ruleReduction[lane] = ruleSupport;
+    __syncthreads();
+
+    for (int stride = kThreadsPerBlock / 2; stride > 0; stride /= 2) {
+        if (lane < stride) {
+            conditionReduction[lane] += conditionReduction[lane + stride];
+            ruleReduction[lane] += ruleReduction[lane + stride];
+        }
+        __syncthreads();
+    }
+
+    if (lane == 0) {
+        supports[candidate * 2] = conditionReduction[0];
+        supports[candidate * 2 + 1] = ruleReduction[0];
+    }
+}
+
+void recordGeometry(int candidateCount, int activeRowCount) {
+    if (!gProfiling)
+        return;
+    ++gProfile.evaluations;
+    gProfile.candidateTotal += candidateCount;
+    gProfile.activeRowTotal += activeRowCount;
+    gProfile.candidateMin = std::min(gProfile.candidateMin, candidateCount);
+    gProfile.candidateMax = std::max(gProfile.candidateMax, candidateCount);
+    gProfile.activeRowMin = std::min(gProfile.activeRowMin, activeRowCount);
+    gProfile.activeRowMax = std::max(gProfile.activeRowMax, activeRowCount);
 }
 
 }  // namespace
@@ -175,7 +325,10 @@ __global__ void countSupportsKernel(
 extern "C" JNIEXPORT jlong JNICALL
 Java_src_solver_QuantMinerGpuSupportCounts_nativeCreateContext(
     JNIEnv* env, jclass, jfloatArray javaValues, jint rowCount, jint dimensions,
-    jintArray javaActiveRows, jint activeRowCount, jbyteArray javaRightEligible) {
+    jintArray javaActiveRows, jint activeRowCount, jbyteArray javaRightEligible,
+    jboolean profiling) {
+    gProfiling = profiling == JNI_TRUE;
+    ScopedTimer contextTimer(gProfile.nativeContextNs);
     if (rowCount < 0 || dimensions <= 0 || activeRowCount < 0
         || activeRowCount > rowCount
         || env->GetArrayLength(javaValues) != rowCount * dimensions
@@ -186,171 +339,203 @@ Java_src_solver_QuantMinerGpuSupportCounts_nativeCreateContext(
     }
 
     DeviceContext* context = new DeviceContext();
+    context->buffers = acquireBuffers();
     context->rowCount = rowCount;
     context->dimensions = dimensions;
     context->activeRowCount = activeRowCount;
+    DeviceBuffers* buffers = context->buffers;
 
-    jfloat* values = env->GetFloatArrayElements(javaValues, nullptr);
-    jint* activeRows = env->GetIntArrayElements(javaActiveRows, nullptr);
-    jbyte* rightEligible = env->GetByteArrayElements(javaRightEligible, nullptr);
-    if (values == nullptr || activeRows == nullptr || rightEligible == nullptr) {
-        if (values != nullptr) env->ReleaseFloatArrayElements(javaValues, values, JNI_ABORT);
-        if (activeRows != nullptr) env->ReleaseIntArrayElements(javaActiveRows, activeRows, JNI_ABORT);
-        if (rightEligible != nullptr) env->ReleaseByteArrayElements(javaRightEligible, rightEligible, JNI_ABORT);
+    buffers->hostValues.resize(static_cast<std::size_t>(rowCount) * dimensions);
+    buffers->hostActiveRows.resize(activeRowCount);
+    buffers->hostRightEligible.resize(rowCount);
+    if (rowCount * dimensions > 0)
+        env->GetFloatArrayRegion(javaValues, 0, rowCount * dimensions,
+                                 buffers->hostValues.data());
+    if (activeRowCount > 0)
+        env->GetIntArrayRegion(javaActiveRows, 0, activeRowCount,
+                               buffers->hostActiveRows.data());
+    if (rowCount > 0)
+        env->GetByteArrayRegion(javaRightEligible, 0, rowCount,
+                                buffers->hostRightEligible.data());
+    if (env->ExceptionCheck()) {
+        releaseBuffers(buffers);
         delete context;
         return 0;
     }
 
     for (int index = 0; index < activeRowCount; ++index) {
-        if (activeRows[index] < 0 || activeRows[index] >= rowCount) {
+        if (buffers->hostActiveRows[index] < 0 || buffers->hostActiveRows[index] >= rowCount) {
             throwJava(env, "java/lang/IllegalArgumentException", "QuantMiner GPU active row is out of range");
             break;
         }
     }
 
-    if (!env->ExceptionCheck()) {
-        upload(env, &context->values, values,
-               static_cast<std::size_t>(rowCount) * dimensions,
-               "HIP value-buffer upload");
-    }
-    if (!env->ExceptionCheck()) {
-        upload(env, &context->activeRows, activeRows, activeRowCount,
-               "HIP active-row upload");
-    }
-    if (!env->ExceptionCheck()) {
-        upload(env, &context->rightEligible,
-               reinterpret_cast<std::uint8_t*>(rightEligible), rowCount,
-               "HIP right-eligibility upload");
-    }
-    if (!env->ExceptionCheck() && rowCount > 0) {
-        checkHip(env, hipMalloc(reinterpret_cast<void**>(&context->leftCovered), rowCount),
-                 "HIP left-coverage allocation");
-    }
-    if (!env->ExceptionCheck() && rowCount > 0) {
-        checkHip(env, hipMalloc(reinterpret_cast<void**>(&context->rightCovered), rowCount),
-                 "HIP right-coverage allocation");
-    }
+    if (!env->ExceptionCheck())
+        ensureCapacity(env, &buffers->values, buffers->valueCapacity,
+                       buffers->hostValues.size(), "HIP value-buffer allocation");
+    if (!env->ExceptionCheck())
+        ensureCapacity(env, &buffers->activeRows, buffers->activeRowCapacity,
+                       buffers->hostActiveRows.size(), "HIP active-row allocation");
+    if (!env->ExceptionCheck())
+        ensureCapacity(env, &buffers->rightEligible, buffers->rightEligibleCapacity,
+                       rowCount, "HIP right-eligibility allocation");
+    if (!env->ExceptionCheck())
+        ensureCapacity(env, &buffers->leftCovered, buffers->leftCoverageCapacity,
+                       rowCount, "HIP left-coverage allocation");
+    if (!env->ExceptionCheck())
+        ensureCapacity(env, &buffers->rightCovered, buffers->rightCoverageCapacity,
+                       rowCount, "HIP right-coverage allocation");
+    if (!env->ExceptionCheck())
+        ensureEvents(env, buffers);
 
-    env->ReleaseFloatArrayElements(javaValues, values, JNI_ABORT);
-    env->ReleaseIntArrayElements(javaActiveRows, activeRows, JNI_ABORT);
-    env->ReleaseByteArrayElements(javaRightEligible, rightEligible, JNI_ABORT);
+    if (!env->ExceptionCheck())
+        h2d(env, buffers->values, buffers->hostValues.data(),
+            buffers->hostValues.size() * sizeof(float), "HIP value-buffer upload");
+    if (!env->ExceptionCheck())
+        h2d(env, buffers->activeRows, buffers->hostActiveRows.data(),
+            buffers->hostActiveRows.size() * sizeof(jint), "HIP active-row upload");
+    if (!env->ExceptionCheck())
+        h2d(env, buffers->rightEligible, buffers->hostRightEligible.data(),
+            buffers->hostRightEligible.size(), "HIP right-eligibility upload");
 
     if (env->ExceptionCheck()) {
-        freeContext(context);
+        releaseBuffers(buffers);
+        delete context;
         return 0;
     }
+    if (gProfiling)
+        ++gProfile.contexts;
     return reinterpret_cast<jlong>(context);
 }
 
-extern "C" JNIEXPORT jintArray JNICALL
+extern "C" JNIEXPORT void JNICALL
 Java_src_solver_QuantMinerGpuSupportCounts_nativeCount(
-    JNIEnv* env, jclass, jlong contextHandle, jfloatArray javaLowerBounds,
-    jfloatArray javaUpperBounds, jint candidateCount, jint intervals,
-    jint leftDimensions, jboolean evaluateLeft, jboolean evaluateRight,
-    jbyteArray javaLeftCovered, jbyteArray javaRightCovered) {
+    JNIEnv* env, jclass, jlong contextHandle, jfloatArray javaPackedBounds,
+    jint candidateCount, jint intervals, jint leftDimensions,
+    jboolean evaluateLeft, jboolean evaluateRight,
+    jbyteArray javaLeftCovered, jbyteArray javaRightCovered,
+    jintArray javaResult) {
+    ScopedTimer jniTimer(gProfile.jniTotalNs);
     DeviceContext* context = reinterpret_cast<DeviceContext*>(contextHandle);
+    const std::size_t boundCount = context == nullptr ? 0
+        : static_cast<std::size_t>(candidateCount) * intervals * 2;
     if (context == nullptr || candidateCount < 0 || intervals != context->dimensions
         || leftDimensions < 0 || leftDimensions > context->dimensions
-        || env->GetArrayLength(javaLowerBounds) < candidateCount * intervals
-        || env->GetArrayLength(javaUpperBounds) < candidateCount * intervals
+        || env->GetArrayLength(javaPackedBounds) < boundCount
         || env->GetArrayLength(javaLeftCovered) != context->rowCount
-        || env->GetArrayLength(javaRightCovered) != context->rowCount) {
+        || env->GetArrayLength(javaRightCovered) != context->rowCount
+        || env->GetArrayLength(javaResult) < candidateCount * 2) {
         throwJava(env, "java/lang/IllegalArgumentException", "Invalid native QuantMiner GPU population");
-        return nullptr;
+        return;
     }
 
-    jintArray javaResult = env->NewIntArray(candidateCount * 2);
-    if (javaResult == nullptr)
-        return nullptr;
+    recordGeometry(candidateCount, context->activeRowCount);
     if (candidateCount == 0)
-        return javaResult;
-    if (!ensurePopulationCapacity(env, context, candidateCount))
-        return nullptr;
+        return;
+    DeviceBuffers* buffers = context->buffers;
+    if (!ensureCapacity(env, &buffers->packedBounds, buffers->boundCapacity,
+                        boundCount, "HIP packed-bound allocation")
+        || !ensureCapacity(env, &buffers->supports, buffers->supportCapacity,
+                           static_cast<std::size_t>(candidateCount) * 2,
+                           "HIP support-count allocation")
+        || !ensureEvents(env, buffers))
+        return;
 
-    jfloat* lowerBounds = env->GetFloatArrayElements(javaLowerBounds, nullptr);
-    jfloat* upperBounds = env->GetFloatArrayElements(javaUpperBounds, nullptr);
-    if (lowerBounds == nullptr || upperBounds == nullptr) {
-        if (lowerBounds != nullptr)
-            env->ReleaseFloatArrayElements(javaLowerBounds, lowerBounds, JNI_ABORT);
-        if (upperBounds != nullptr)
-            env->ReleaseFloatArrayElements(javaUpperBounds, upperBounds, JNI_ABORT);
-        return nullptr;
-    }
-
-    checkHip(env, hipMemcpy(context->lowerBounds, lowerBounds,
-                            static_cast<std::size_t>(candidateCount) * intervals * sizeof(float),
-                            hipMemcpyHostToDevice),
-             "HIP lower-bound upload");
-    if (!env->ExceptionCheck()) {
-        checkHip(env, hipMemcpy(context->upperBounds, upperBounds,
-                                static_cast<std::size_t>(candidateCount) * intervals * sizeof(float),
-                                hipMemcpyHostToDevice),
-                 "HIP upper-bound upload");
-    }
-    env->ReleaseFloatArrayElements(javaLowerBounds, lowerBounds, JNI_ABORT);
-    env->ReleaseFloatArrayElements(javaUpperBounds, upperBounds, JNI_ABORT);
+    buffers->hostPackedBounds.resize(boundCount);
+    buffers->hostSupports.resize(static_cast<std::size_t>(candidateCount) * 2);
+    env->GetFloatArrayRegion(javaPackedBounds, 0, boundCount,
+                             buffers->hostPackedBounds.data());
     if (env->ExceptionCheck())
-        return nullptr;
-
-    if (!evaluateLeft && context->rowCount > 0) {
-        jbyte* leftCovered = env->GetByteArrayElements(javaLeftCovered, nullptr);
-        if (leftCovered == nullptr)
-            return nullptr;
-        checkHip(env, hipMemcpy(context->leftCovered, leftCovered, context->rowCount,
-                                hipMemcpyHostToDevice),
-                 "HIP left-coverage upload");
-        env->ReleaseByteArrayElements(javaLeftCovered, leftCovered, JNI_ABORT);
-    }
+        return;
+    h2d(env, buffers->packedBounds, buffers->hostPackedBounds.data(),
+        boundCount * sizeof(float), "HIP packed-bound upload");
     if (env->ExceptionCheck())
-        return nullptr;
-    if (!evaluateRight && context->rowCount > 0) {
-        jbyte* rightCovered = env->GetByteArrayElements(javaRightCovered, nullptr);
-        if (rightCovered == nullptr)
-            return nullptr;
-        checkHip(env, hipMemcpy(context->rightCovered, rightCovered, context->rowCount,
-                                hipMemcpyHostToDevice),
-                 "HIP right-coverage upload");
-        env->ReleaseByteArrayElements(javaRightCovered, rightCovered, JNI_ABORT);
-    }
-    if (env->ExceptionCheck())
-        return nullptr;
+        return;
 
-    const int threadsPerBlock = 256;
-    const int blocks = (candidateCount + threadsPerBlock - 1) / threadsPerBlock;
-    int* deviceConditionSupports = context->supports;
-    int* deviceRuleSupports = context->supports + candidateCount;
-    hipLaunchKernelGGL(countSupportsKernel, dim3(blocks), dim3(threadsPerBlock), 0, 0,
-                       context->values, context->activeRows, context->rightEligible,
-                       context->leftCovered, context->rightCovered,
-                       context->lowerBounds, context->upperBounds,
+    if (!evaluateLeft)
+        uploadCoverage(env, context, javaLeftCovered, true);
+    if (!env->ExceptionCheck() && !evaluateRight)
+        uploadCoverage(env, context, javaRightCovered, false);
+    if (env->ExceptionCheck())
+        return;
+
+    if (gProfiling) {
+        checkHip(env, hipEventRecord(buffers->kernelStart), "HIP kernel-start event");
+        if (env->ExceptionCheck())
+            return;
+    }
+    hipLaunchKernelGGL(countSupportsKernel, dim3(candidateCount), dim3(kThreadsPerBlock), 0, 0,
+                       buffers->values, buffers->activeRows, buffers->rightEligible,
+                       buffers->leftCovered, buffers->rightCovered, buffers->packedBounds,
                        context->rowCount, context->activeRowCount, context->dimensions,
-                       candidateCount, leftDimensions, evaluateLeft == JNI_TRUE,
-                       evaluateRight == JNI_TRUE,
-                       deviceConditionSupports, deviceRuleSupports);
+                       leftDimensions, evaluateLeft == JNI_TRUE, evaluateRight == JNI_TRUE,
+                       buffers->supports);
     checkHip(env, hipGetLastError(), "HIP support-count kernel launch");
     if (env->ExceptionCheck())
-        return nullptr;
+        return;
 
-    jint* hostSupports = new jint[static_cast<std::size_t>(candidateCount) * 2];
-    checkHip(env, hipMemcpy(hostSupports, context->supports,
-                            static_cast<std::size_t>(candidateCount) * 2 * sizeof(int),
-                            hipMemcpyDeviceToHost),
-             "HIP support-count download");
-    if (!env->ExceptionCheck()) {
-        jint* packedSupports = new jint[static_cast<std::size_t>(candidateCount) * 2];
-        for (int candidate = 0; candidate < candidateCount; ++candidate) {
-            packedSupports[candidate * 2] = hostSupports[candidate];
-            packedSupports[candidate * 2 + 1] = hostSupports[candidate + candidateCount];
-        }
-        env->SetIntArrayRegion(javaResult, 0, candidateCount * 2, packedSupports);
-        delete[] packedSupports;
+    if (gProfiling) {
+        checkHip(env, hipEventRecord(buffers->kernelStop), "HIP kernel-stop event");
+        if (!env->ExceptionCheck())
+            checkHip(env, hipEventSynchronize(buffers->kernelStop), "HIP kernel synchronization");
+        if (env->ExceptionCheck())
+            return;
+        float kernelMs = 0.0f;
+        checkHip(env, hipEventElapsedTime(&kernelMs, buffers->kernelStart, buffers->kernelStop),
+                 "HIP kernel timing");
+        if (env->ExceptionCheck())
+            return;
+        gProfile.kernelNs += static_cast<std::uint64_t>(kernelMs * 1000000.0f);
     }
-    delete[] hostSupports;
-    return env->ExceptionCheck() ? nullptr : javaResult;
+
+    Clock::time_point downloadStart = timerStart();
+    hipError_t downloadStatus = hipMemcpy(buffers->hostSupports.data(), buffers->supports,
+                                          buffers->hostSupports.size() * sizeof(jint),
+                                          hipMemcpyDeviceToHost);
+    gProfile.d2hNs += timerElapsed(downloadStart);
+    checkHip(env, downloadStatus, "HIP support-count download");
+    if (env->ExceptionCheck())
+        return;
+    env->SetIntArrayRegion(javaResult, 0, candidateCount * 2, buffers->hostSupports.data());
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_src_solver_QuantMinerGpuSupportCounts_nativeReleaseContext(
     JNIEnv*, jclass, jlong contextHandle) {
-    freeContext(reinterpret_cast<DeviceContext*>(contextHandle));
+    DeviceContext* context = reinterpret_cast<DeviceContext*>(contextHandle);
+    if (context == nullptr)
+        return;
+    releaseBuffers(context->buffers);
+    delete context;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_src_solver_QuantMinerGpuSupportCounts_nativeDumpProfile(JNIEnv*, jclass) {
+    if (!gProfiling)
+        return;
+    const int candidateMin = gProfile.candidateMin == std::numeric_limits<int>::max()
+        ? 0 : gProfile.candidateMin;
+    const int activeRowMin = gProfile.activeRowMin == std::numeric_limits<int>::max()
+        ? 0 : gProfile.activeRowMin;
+    std::cerr << std::fixed << std::setprecision(6)
+              << "QUANTMINER_GPU_NATIVE_PROFILE"
+              << " contexts=" << gProfile.contexts
+              << " evaluations=" << gProfile.evaluations
+              << " native_context_s=" << gProfile.nativeContextNs / 1.0e9
+              << " jni_total_s=" << gProfile.jniTotalNs / 1.0e9
+              << " allocation_s=" << gProfile.allocationNs / 1.0e9
+              << " h2d_s=" << gProfile.h2dNs / 1.0e9
+              << " kernel_s=" << gProfile.kernelNs / 1.0e9
+              << " d2h_s=" << gProfile.d2hNs / 1.0e9
+              << " candidate_total=" << gProfile.candidateTotal
+              << " candidate_min=" << candidateMin
+              << " candidate_max=" << gProfile.candidateMax
+              << " active_row_mean_per_evaluation="
+              << (gProfile.evaluations == 0 ? 0.0
+                  : static_cast<double>(gProfile.activeRowTotal) / gProfile.evaluations)
+              << " active_row_min=" << activeRowMin
+              << " active_row_max=" << gProfile.activeRowMax
+              << " coverage_uploads=" << gProfile.coverageUploads
+              << " coverage_cache_hits=" << gProfile.coverageCacheHits
+              << std::endl;
 }

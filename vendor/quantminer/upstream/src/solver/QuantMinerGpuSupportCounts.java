@@ -20,8 +20,13 @@ public final class QuantMinerGpuSupportCounts {
     private static final String ENABLE_ENVIRONMENT = "QUANTMINER_GPU";
     private static final String LIBRARY_PROPERTY = "quantminer.gpu.library";
     private static final String LIBRARY_ENVIRONMENT = "QUANTMINER_GPU_LIBRARY";
+    private static final String PROFILE_PROPERTY = "quantminer.gpu.profile";
+    private static final String PROFILE_ENVIRONMENT = "QUANTMINER_GPU_PROFILE";
 
     private static boolean nativeLoaded = false;
+    private static long contextCreationNanos = 0;
+    private static long javaPackingNanos = 0;
+    private static long javaUnpackingNanos = 0;
 
     private QuantMinerGpuSupportCounts() {}
 
@@ -68,6 +73,37 @@ public final class QuantMinerGpuSupportCounts {
         }
     }
 
+    public static boolean isProfileRequested() {
+        return isTrue(System.getProperty(PROFILE_PROPERTY))
+            || isTrue(System.getenv(PROFILE_ENVIRONMENT));
+    }
+
+    public static synchronized void recordContextCreation(long nanos) {
+        if (isProfileRequested())
+            contextCreationNanos += nanos;
+    }
+
+    public static synchronized void recordJavaPacking(long nanos) {
+        if (isProfileRequested())
+            javaPackingNanos += nanos;
+    }
+
+    public static synchronized void recordJavaUnpacking(long nanos) {
+        if (isProfileRequested())
+            javaUnpackingNanos += nanos;
+    }
+
+    public static synchronized void dumpProfile() {
+        if (!isProfileRequested())
+            return;
+        System.err.println("QUANTMINER_GPU_JAVA_PROFILE"
+            + " context_creation_s=" + contextCreationNanos / 1.0e9
+            + " packing_s=" + javaPackingNanos / 1.0e9
+            + " unpacking_s=" + javaUnpackingNanos / 1.0e9);
+        if (nativeLoaded)
+            nativeDumpProfile();
+    }
+
     public static boolean supportsConfiguration(int leftDisjunctions, int rightDisjunctions,
                                                  int currentLeftDisjunction, int currentRightDisjunction,
                                                  int dimensions, int intervals) {
@@ -90,7 +126,8 @@ public final class QuantMinerGpuSupportCounts {
             throw new IllegalArgumentException("Invalid QuantMiner GPU right-coverage buffer");
 
         long handle = nativeCreateContext(dimensionMajorValues, rowCount, dimensions,
-                                          activeRows, activeRowCount, rightEligible);
+                                          activeRows, activeRowCount, rightEligible,
+                                          isProfileRequested());
         if (handle == 0)
             throw new IllegalStateException("HIP returned a null QuantMiner GPU context");
         return new Context(handle, rowCount, dimensions);
@@ -107,28 +144,26 @@ public final class QuantMinerGpuSupportCounts {
             this.dimensions = dimensions;
         }
 
-        public synchronized int[] count(float[] lowerBounds, float[] upperBounds, int candidateCount,
-                                        int intervals, int leftDimensions, boolean evaluateLeft,
-                                        boolean evaluateRight, byte[] leftCovered, byte[] rightCovered) {
+        public synchronized void count(float[] packedBounds, int candidateCount,
+                                       int intervals, int leftDimensions, boolean evaluateLeft,
+                                       boolean evaluateRight, byte[] leftCovered, byte[] rightCovered,
+                                       int[] result) {
             if (handle == 0)
                 throw new IllegalStateException("QuantMiner GPU context is closed");
             if (candidateCount < 0 || intervals != dimensions || leftDimensions < 0
                 || leftDimensions > dimensions)
                 throw new IllegalArgumentException("Invalid QuantMiner GPU population geometry");
-            if (lowerBounds == null || upperBounds == null
-                || lowerBounds.length < candidateCount * intervals
-                || upperBounds.length < candidateCount * intervals)
-                throw new IllegalArgumentException("Invalid QuantMiner GPU interval buffers");
+            if (packedBounds == null || packedBounds.length < candidateCount * intervals * 2)
+                throw new IllegalArgumentException("Invalid QuantMiner GPU packed interval buffer");
             if (leftCovered == null || rightCovered == null
                 || leftCovered.length != rowCount || rightCovered.length != rowCount)
                 throw new IllegalArgumentException("Invalid QuantMiner GPU coverage buffers");
+            if (result == null || result.length < candidateCount * 2)
+                throw new IllegalArgumentException("Invalid QuantMiner GPU result buffer");
 
-            int[] result = nativeCount(handle, lowerBounds, upperBounds, candidateCount, intervals,
-                                       leftDimensions, evaluateLeft, evaluateRight,
-                                       leftCovered, rightCovered);
-            if (result == null || result.length != candidateCount * 2)
-                throw new IllegalStateException("HIP returned an invalid QuantMiner support-count buffer");
-            return result;
+            nativeCount(handle, packedBounds, candidateCount, intervals,
+                        leftDimensions, evaluateLeft, evaluateRight,
+                        leftCovered, rightCovered, result);
         }
 
         public synchronized void close() {
@@ -141,12 +176,14 @@ public final class QuantMinerGpuSupportCounts {
 
     private static native long nativeCreateContext(float[] values, int rowCount, int dimensions,
                                                     int[] activeRows, int activeRowCount,
-                                                    byte[] rightEligible);
+                                                    byte[] rightEligible, boolean profiling);
 
-    private static native int[] nativeCount(long handle, float[] lowerBounds, float[] upperBounds,
-                                            int candidateCount, int intervals, int leftDimensions,
-                                            boolean evaluateLeft, boolean evaluateRight,
-                                            byte[] leftCovered, byte[] rightCovered);
+    private static native void nativeCount(long handle, float[] packedBounds,
+                                           int candidateCount, int intervals, int leftDimensions,
+                                           boolean evaluateLeft, boolean evaluateRight,
+                                           byte[] leftCovered, byte[] rightCovered, int[] result);
 
     private static native void nativeReleaseContext(long handle);
+
+    private static native void nativeDumpProfile();
 }
