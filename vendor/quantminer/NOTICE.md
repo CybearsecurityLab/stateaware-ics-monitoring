@@ -16,4 +16,6 @@ This package contains the upstream Java sources (`upstream/src`), upstream `buil
 
 The Python adapter can schedule independent component-state runs across multiple processes. Each process invokes the same single-threaded Java engine with identical inputs and configuration; this scheduling adaptation does not parallelize or modify the Java algorithm itself.
 
+The Java bitset evaluator is the default for supported single-disjunction configurations and can be disabled with `quantminer.bitset=false` or `QUANTMINER_BITSET=0`. It uses exact interval masks, exact cached binomial coefficients and exact per-template duplicate-support caching. Lockstep validation is opt-in. Unsupported configurations retain their existing CPU fallback.
+
 An opt-in HIP/JNI support-count prototype is under `gpu/`. It passes randomized support-count and Anytown rule-level parity checks. Row-parallel reduction and transfer optimizations make it approximately 1.9–2.0× faster than the original CPU in controlled Anytown benchmarks. It is disabled by default; full C-Town/L-Town results are recorded separately when available.

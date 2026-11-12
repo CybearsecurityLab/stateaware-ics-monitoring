@@ -1,6 +1,7 @@
 import src.apriori.AssociationRule;
 import src.database.DatabaseAdmin;
 import src.geneticAlgorithm.OptimizerGeneticAlgo;
+import src.solver.QuantMinerBitsetSupportCounts;
 import src.solver.QuantMinerGpuSupportCounts;
 import src.solver.ResolutionContext;
 import src.solver.RuleTester;
@@ -45,6 +46,7 @@ public final class QuantMinerCli {
         tester.DefinirOptimiseurRegle(new OptimizerGeneticAlgo());
         tester.run();
         AssociationRule[] rules = (AssociationRule[]) tester.ObtenirListeReglesOptimales().toArray(new AssociationRule[0]);
+        QuantMinerBitsetSupportCounts.dumpProfile();
         context.SauvegarderReglesCsv(output, rules);
         System.out.println("rules=" + rules.length);
         QuantMinerGpuSupportCounts.dumpProfile();

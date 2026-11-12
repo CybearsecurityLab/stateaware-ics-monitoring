@@ -196,6 +196,22 @@ public class AprioriQuantitative {
         return factorialCache[value];
     }
 
+    private static final HashMap<Long, BigInteger> binomialCache = new HashMap<>();
+
+    private static synchronized BigInteger binomial(int n, int k) {
+        if (n < 0 || k < 0 || k > n)
+            throw new IllegalArgumentException("invalid binomial coefficients");
+        if (k == 0 || k == n)
+            return BigInteger.ONE;
+        long key = ((long)n << 32) | (k & 0xffffffffL);
+        BigInteger cached = binomialCache.get(key);
+        if (cached == null) {
+            cached = factorial(n).divide(factorial(k).multiply(factorial(n - k)));
+            binomialCache.put(key, cached);
+        }
+        return cached;
+    }
+
     // Calcule tous les ensembles d'items possibles, chaque ensemble �tant constitu� de 'iNombrePlaces' �l�ments
     // (renvoie un tableau indiquant la pr�sence ou non du i-�me item dans l'ensemble) :
     /**
@@ -211,7 +227,7 @@ public class AprioriQuantitative {
         int iNombreItemsRestants = 0;
         int iNombrePlacesRestantes = 0;
         // Exact combinatorics avoid 32-bit factorial overflow on wide inputs.
-        BigInteger factN, factP, factN_P, iCNP;
+        BigInteger iCNP;
         
         if (iNombreItems==0) return null;
  
@@ -225,10 +241,7 @@ public class AprioriQuantitative {
             
             if (iNombreItemsRestants>iNombrePlacesRestantes) {
 
-                factN = factorial(iNombreItemsRestants - 1);
-                factP = factorial(iNombrePlacesRestantes - 1);
-                factN_P = factorial(iNombreItemsRestants - iNombrePlacesRestantes);
-                iCNP = factN.divide(factP.multiply(factN_P));
+                iCNP = binomial(iNombreItemsRestants - 1, iNombrePlacesRestantes - 1);
 
             }
             // Sinon cas iNombreItemsRestants == iNombrePlacesRestantes :

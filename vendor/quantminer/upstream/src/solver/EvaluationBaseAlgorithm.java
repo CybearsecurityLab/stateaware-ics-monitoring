@@ -178,6 +178,11 @@ public abstract class EvaluationBaseAlgorithm {
     private int [] m_tSupportsGpu = null;
     private byte [] m_tLignesCouvertesGaucheGpu = null;
     private byte [] m_tLignesCouvertesDroiteGpu = null;
+    private QuantMinerBitsetSupportCounts.Context m_contexteBitset = null;
+    private float [] m_tBornesBitset = null;
+    private int [] m_tSupportsBitset = null;
+    private byte [] m_tLignesCouvertesGaucheBitset = null;
+    private byte [] m_tLignesCouvertesDroiteBitset = null;
     private float [] m_tValeursCpu = null;
     private float [] m_tBornesCpu = null;
     
@@ -413,6 +418,10 @@ public abstract class EvaluationBaseAlgorithm {
             m_contexteGpu = null;
         }
         m_tValeursCpu = null;
+        if (m_contexteBitset != null) {
+            m_contexteBitset.close();
+            m_contexteBitset = null;
+        }
 
         Item item = null;
         ItemQualitative itemQual = null;
@@ -917,6 +926,78 @@ public abstract class EvaluationBaseAlgorithm {
     }
 
 
+    private boolean EvaluerSupportsReglesPotentiellesBitset() {
+        if (!QuantMinerBitsetSupportCounts.supportsConfiguration(
+                m_schemaRegleOptimale.m_iNombreDisjonctionsGauche,
+                m_schemaRegleOptimale.m_iNombreDisjonctionsDroite,
+                m_iDisjonctionGaucheCourante, m_iDisjonctionDroiteCourante,
+                m_iDimension, m_iNombreTotalIntervalles))
+            return false;
+
+        if (m_contexteBitset == null) {
+            float[] tValeursBitset = new float[m_iDimension * m_iNombreTransactions];
+            byte[] tLignesDroiteBitset = new byte[m_iNombreTransactions];
+            for (int iIndiceDimension = 0; iIndiceDimension < m_iDimension; iIndiceDimension++) {
+                DataColumn colonneDonnees = iIndiceDimension < m_iNombreItemsQuantCond
+                    ? m_tItemsQuantCond[iIndiceDimension].m_colonneDonnees
+                    : m_tItemsQuantObj[iIndiceDimension - m_iNombreItemsQuantCond].m_colonneDonnees;
+                System.arraycopy(colonneDonnees.m_tValeurReelle, 0, tValeursBitset,
+                                 iIndiceDimension * m_iNombreTransactions, m_iNombreTransactions);
+            }
+            for (int iIndiceLigne = 0; iIndiceLigne < m_iNombreTransactions; iIndiceLigne++)
+                tLignesDroiteBitset[iIndiceLigne] = m_tPrendreEnCompteLigneDroite[iIndiceLigne] ? (byte)1 : (byte)0;
+
+            int[] tLignesActivesBitset = Arrays.copyOf(m_tLignesAPrendreEnCompte,
+                                                       m_iNombreLignesAPrendreEnCompte);
+            m_contexteBitset = QuantMinerBitsetSupportCounts.createContext(
+                tValeursBitset, m_iNombreTransactions, m_iDimension,
+                tLignesActivesBitset, m_iNombreLignesAPrendreEnCompte, tLignesDroiteBitset);
+            if (m_tLignesCouvertesGaucheBitset == null
+                || m_tLignesCouvertesGaucheBitset.length != m_iNombreTransactions) {
+                m_tLignesCouvertesGaucheBitset = new byte[m_iNombreTransactions];
+                m_tLignesCouvertesDroiteBitset = new byte[m_iNombreTransactions];
+            }
+        }
+
+        int iNombreValeursBornes = m_iNombreReglesPotentiellesAEvaluer * m_iDimension * 2;
+        int iNombreSupports = m_iNombreReglesPotentiellesAEvaluer * 2;
+        if (m_tBornesBitset == null || m_tBornesBitset.length < iNombreValeursBornes)
+            m_tBornesBitset = new float[iNombreValeursBornes];
+        if (m_tSupportsBitset == null || m_tSupportsBitset.length < iNombreSupports)
+            m_tSupportsBitset = new int[iNombreSupports];
+
+        for (int iIndiceRegle = 0; iIndiceRegle < m_iNombreReglesPotentiellesAEvaluer; iIndiceRegle++) {
+            ReglePotentielle reglePotentielle = m_tReglesPotentiellesAEvaluer[iIndiceRegle];
+            int iDecalage = iIndiceRegle * m_iDimension * 2;
+            for (int iIndiceDimension = 0; iIndiceDimension < m_iDimension; iIndiceDimension++) {
+                m_tBornesBitset[iDecalage + iIndiceDimension * 2] = reglePotentielle.m_tIntervalleMin[iIndiceDimension];
+                m_tBornesBitset[iDecalage + iIndiceDimension * 2 + 1] = reglePotentielle.m_tIntervalleMax[iIndiceDimension];
+            }
+        }
+
+        if (!m_bPrendreEnCompteQuantitatifsGauche) {
+            for (int iIndiceLigne = 0; iIndiceLigne < m_iNombreTransactions; iIndiceLigne++)
+                m_tLignesCouvertesGaucheBitset[iIndiceLigne] = m_tLignesCouvertesGauche[iIndiceLigne] ? (byte)1 : (byte)0;
+        }
+        if (!m_bPrendreEnCompteQuantitatifsDroite) {
+            for (int iIndiceLigne = 0; iIndiceLigne < m_iNombreTransactions; iIndiceLigne++)
+                m_tLignesCouvertesDroiteBitset[iIndiceLigne] = m_tLignesCouvertesDroite[iIndiceLigne] ? (byte)1 : (byte)0;
+        }
+
+        m_contexteBitset.count(
+            m_tBornesBitset, m_iNombreReglesPotentiellesAEvaluer,
+            m_iNombreTotalIntervalles, m_iNombreItemsQuantCond,
+            m_bPrendreEnCompteQuantitatifsGauche, m_bPrendreEnCompteQuantitatifsDroite,
+            m_tLignesCouvertesGaucheBitset, m_tLignesCouvertesDroiteBitset, m_tSupportsBitset);
+        for (int iIndiceRegle = 0; iIndiceRegle < m_iNombreReglesPotentiellesAEvaluer; iIndiceRegle++) {
+            ReglePotentielle reglePotentielle = m_tReglesPotentiellesAEvaluer[iIndiceRegle];
+            reglePotentielle.m_iSupportCond = m_tSupportsBitset[iIndiceRegle * 2];
+            reglePotentielle.m_iSupportRegle = m_tSupportsBitset[iIndiceRegle * 2 + 1];
+        }
+        return true;
+    }
+
+
     private boolean EvaluerSupportsReglesPotentiellesGpu() {
         if (!QuantMinerGpuSupportCounts.supportsConfiguration(
                 m_schemaRegleOptimale.m_iNombreDisjonctionsGauche,
@@ -1000,6 +1081,21 @@ public abstract class EvaluationBaseAlgorithm {
 
 
 
+    static void assertLockstepSupports(int[] optimized, int[] original, int candidateCount) {
+        if (optimized == null || original == null
+            || optimized.length < candidateCount * 2 || original.length < candidateCount * 2)
+            throw new AssertionError("QuantMiner lockstep received invalid support buffers");
+        for (int candidate = 0; candidate < candidateCount; candidate++) {
+            if (optimized[candidate * 2] != original[candidate * 2]
+                || optimized[candidate * 2 + 1] != original[candidate * 2 + 1]) {
+                throw new AssertionError("QuantMiner lockstep support mismatch at candidate " + candidate
+                    + ": optimized=" + optimized[candidate * 2] + "/" + optimized[candidate * 2 + 1]
+                    + ", original=" + original[candidate * 2] + "/" + original[candidate * 2 + 1]);
+            }
+        }
+    }
+
+
     /**
      * Evaluation of the set of potential rules in one scan of the dataset
      */
@@ -1037,8 +1133,23 @@ public abstract class EvaluationBaseAlgorithm {
             reglePotentielle.m_iSupportRegle = 0;
         }
         
-        if (!EvaluerSupportsReglesPotentiellesGpu()
-                && !EvaluerSupportsReglesPotentiellesPackedCpu()) {
+        boolean bSupportsOptimises = EvaluerSupportsReglesPotentiellesBitset();
+        if (!bSupportsOptimises)
+            bSupportsOptimises = EvaluerSupportsReglesPotentiellesGpu();
+        boolean bSupportsPackedCpu = !bSupportsOptimises && EvaluerSupportsReglesPotentiellesPackedCpu();
+        int[] tSupportsOptimisesLockstep = null;
+        if (bSupportsOptimises && QuantMinerBitsetSupportCounts.isLockstepRequested()) {
+            tSupportsOptimisesLockstep = new int[m_iNombreReglesPotentiellesAEvaluer * 2];
+            for (iIndiceReglePotentielle=0;iIndiceReglePotentielle<m_iNombreReglesPotentiellesAEvaluer;iIndiceReglePotentielle++) {
+                reglePotentielle = m_tReglesPotentiellesAEvaluer[iIndiceReglePotentielle];
+                tSupportsOptimisesLockstep[iIndiceReglePotentielle * 2] = reglePotentielle.m_iSupportCond;
+                tSupportsOptimisesLockstep[iIndiceReglePotentielle * 2 + 1] = reglePotentielle.m_iSupportRegle;
+                reglePotentielle.m_iSupportCond = 0;
+                reglePotentielle.m_iSupportRegle = 0;
+            }
+        }
+
+        if ((!bSupportsOptimises && !bSupportsPackedCpu) || tSupportsOptimisesLockstep != null) {
         tValeursReelles = new float [m_iDimension];
         
 
@@ -1125,6 +1236,18 @@ public abstract class EvaluationBaseAlgorithm {
                 }
             }
         }
+        }
+
+        if (tSupportsOptimisesLockstep != null) {
+            int[] tSupportsOriginauxLockstep = new int[m_iNombreReglesPotentiellesAEvaluer * 2];
+            for (iIndiceReglePotentielle=0;iIndiceReglePotentielle<m_iNombreReglesPotentiellesAEvaluer;iIndiceReglePotentielle++) {
+                reglePotentielle = m_tReglesPotentiellesAEvaluer[iIndiceReglePotentielle];
+                tSupportsOriginauxLockstep[iIndiceReglePotentielle * 2] = reglePotentielle.m_iSupportCond;
+                tSupportsOriginauxLockstep[iIndiceReglePotentielle * 2 + 1] = reglePotentielle.m_iSupportRegle;
+            }
+            assertLockstepSupports(tSupportsOptimisesLockstep, tSupportsOriginauxLockstep,
+                                   m_iNombreReglesPotentiellesAEvaluer);
+            QuantMinerBitsetSupportCounts.recordLockstepEvaluation(m_iNombreReglesPotentiellesAEvaluer);
         }
       
         
