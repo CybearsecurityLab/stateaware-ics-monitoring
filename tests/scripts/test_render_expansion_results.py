@@ -35,6 +35,8 @@ def test_baseline_bolding_is_per_topology_and_includes_ties(monkeypatch):
     assert any(line.startswith("IMD-max") for line in lines)
     assert not any(line.startswith("O+O") for line in lines)
     assert not any(line.startswith("ctown") or line.startswith("ltown") for line in render.tolerance().splitlines())
+    assert "Ref" in render.ablation()
+    assert "\\textbf{1.0000}" not in render.ablation()
 
 
 def test_historical_quantminer_failure_is_pending_for_corrected_run(

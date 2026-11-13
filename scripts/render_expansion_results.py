@@ -55,6 +55,9 @@ def ablation() -> str:
                 f"{fmt(values['balanced_accuracy'], best=values['balanced_accuracy'] == best['balanced_accuracy'])} & "
                 f"{fmt(values['aucpr'], best=values['aucpr'] == best['aucpr'])} & "
                 rf"{values['tp']} & {values['fp']} & {values['fn']} \\")
+        positives = int(frame.y_true.sum())
+        lines.append(
+            rf" & Ref & 1.0000 & 1.0000 & 1.0000 & {positives} & 0 & 0 \\")
         lines.append(r"\midrule")
     lines[-1] = r"\bottomrule"
     lines.append(r"\end{tabular}")
@@ -212,7 +215,7 @@ def main() -> int:
     documents = {
         OUT_ABLATION: (
             "\\begin{table}[t]\n\\centering\n"
-            "\\caption{Expanded attack-corpus ablation. Counts include all held-out rows; injection windows define positive labels. Arms: GFSM (G), $\\Phi$, STL, and fusion (C).}\n"
+            "\\caption{Expanded attack-corpus ablation. Counts include all held-out rows; injection windows define positive labels. Arms: GFSM (G), $\\Phi$, STL, and fusion (C). Ref is an oracle reference, not a method.}\n"
             "\\label{tab:expanded_ablation}\n"
             f"{ablation()}\n\\end{{table}}\n"
         ),
