@@ -274,3 +274,8 @@ paper/
 !vendor/quantminer/dist/*.jar
 TODO.md
 review/
+data/generated/
+generated/*/gfsm/*.gfsm.json
+generated/*/gfsm/*.gfsm.dot
+generated/*/invariants/*_phi.json
+*.DS_Store*

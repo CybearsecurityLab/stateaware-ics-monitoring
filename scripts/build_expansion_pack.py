@@ -60,7 +60,7 @@ def baselines(topology: str) -> dict:
     result = {}
     for name in ("cusum", "sain", "sain_local", "sicams", "imdisco", "imdisco_maximal", "hybrid", "conv"):
         method_root = {
-            "sain_local": "full_signal_sain_local_quantminer",
+            "sain_local": "full_signal_sain_local_quantminer_bitset",
             "imdisco_maximal": "full_signal_imdisco_maximal",
         }.get(name, f"full_signal_{name}")
         path = ROOT / f"scripts/out/{method_root}/{topology}/metrics.json"

@@ -51,7 +51,7 @@ def test_historical_quantminer_failure_is_pending_for_corrected_run(
 
 
 def test_current_quantminer_failure_is_not_relabelled(tmp_path, monkeypatch):
-    output = tmp_path / "scripts/out/full_signal_sain_local_quantminer/ctown"
+    output = tmp_path / "scripts/out/full_signal_sain_local_quantminer_bitset/ctown"
     output.mkdir(parents=True)
     (output / "metrics.json").write_text(json.dumps({
         "status": "mining_errors",

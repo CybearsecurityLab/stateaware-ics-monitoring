@@ -77,7 +77,7 @@ def baseline_one(method: str, topology: str) -> dict | None:
             "metrics": detection_metrics(frame["y_true"], frame[flag], frame[score]),
         }
     method_root = {
-        "sain_local": "full_signal_sain_local_quantminer",
+        "sain_local": "full_signal_sain_local_quantminer_bitset",
         "imdisco_maximal": "full_signal_imdisco_maximal",
     }.get(method, f"full_signal_{method}")
     if method == "sain_local":
@@ -161,7 +161,7 @@ def baselines() -> str:
             "sain_local": "abbas2024sain",
             "sicams": "sicams2025",
             "imdisco": "imdisco2024",
-            "imdisco_maximal": "imdisco2024",
+            "imdisco_maximal": "saraiva2024imdisco",
             "hybrid": "ahmed2025hybridensemblemethoddetecting",
             "conv": "lee2024advancing",
         }[method]

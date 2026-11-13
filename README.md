@@ -118,7 +118,7 @@ Local SAIN has two separately preserved engines:
 - **NiaARM:** local per-CASE-state models on all three towns.
 - **Official QuantMiner:** actual official rules parsed and evaluated per local state, with support 0.1, confidence 0.7 and the approved `max_attributes=2` adaptation.
 
-The three-attribute QuantMiner attempt exposed upstream 32-bit factorial overflow. Exact BigInteger combinatorics fix that overflow. Where upstream arithmetic is already valid, the correction preserves combinations, support, confidence and rule semantics; it does not establish full-width equivalence or tractability. Exact state-local constant channels are excluded from QuantMiner input as static variables but retained as separately recorded point-interval invariants. Every nonconstant observable feature is retained, and all constants are named. Failed three-attribute artifacts are under `scripts/out/full_signal_sain_local_quantminer_three_attribute/`; the reduced-width runs use `scripts/out/full_signal_sain_local_quantminer/`.
+The three-attribute QuantMiner attempt exposed upstream 32-bit factorial overflow. Exact BigInteger combinatorics fix that overflow. Where upstream arithmetic is already valid, the correction preserves combinations, support, confidence and rule semantics; it does not establish full-width equivalence or tractability. Exact state-local constant channels are excluded from QuantMiner input as static variables but retained as separately recorded point-interval invariants. Every nonconstant observable feature is retained, and all constants are named. Failed three-attribute artifacts are under `scripts/out/full_signal_sain_local_quantminer_three_attribute/`; the reduced-width runs use `scripts/out/full_signal_sain_local_quantminer_bitset/`.
 
 For QuantMiner, `--jobs N` schedules independent `(component, state)` mining tasks across N processes. Each Java process runs the unchanged single-threaded official engine; the scheduler preserves inputs, configuration, artifact paths and deterministic result ordering. State-parallel validation artifacts are under `scripts/out/full_signal_sain_local_quantminer_state_parallel/`. The official engine has no GPU backend. The default Java bitset evaluator is about 3.1× faster than the original CPU on Anytown and 2.1× faster on a reduced real C-Town evaluator, with exact support-count and rule-level parity. An opt-in HIP/JNI backend is also available and is about 1.9–2.0× faster in controlled benchmarks. Exact cached binomial coefficients, shared class caching and per-template duplicate-support caching reduce additional work. Unsupported geometries retain their original CPU fallback.
 
@@ -167,7 +167,7 @@ uv run --no-sync python scripts/render_expansion_results.py
 | State-aware CUSUM | Runs on all three towns | Uses INP-derived signed flows and exact tank areas; no SWaT-specific threshold transfer. |
 | Global source-derived SAIN | Runs on all three towns | Uses recovered PDG invariants and separate official QuantMiner artifacts; SMONITOR is unavailable. |
 | Local NiaARM SAIN | Runs on all three towns | Separate per-CASE-state adaptation. |
-| Local official QuantMiner | Anytown complete; C-Town/L-Town active | Two-attribute adaptation with exact overflow correction and parsed official rules. |
+| Local official QuantMiner | Complete on all three towns | Two-attribute adaptation with exact overflow correction, parsed official rules and default exact bitset evaluation. |
 | SICAMS | Runs on all three towns | Per-sensor covariance models and INP-backed Laplacian fields; range classification and volume regression unavailable. |
 | Hybrid Ensemble | Runs on all three towns | Independent manifested episodes, out-of-fold stacking and training-only warm-up; every evaluation row scored. |
 | ConvBiLSTM-AE | Runs on all three towns | Float64 residual scoring makes every row finite; normal-validation thresholds only. |
@@ -183,7 +183,7 @@ scripts/out/logic_attack_predictions/   Original, timing, obligation, Phi, STL a
 scripts/out/logic_tolerance_sweep/      All 27 preserved tolerance configurations
 scripts/out/full_signal_sain/           Global SAIN and official QuantMiner artifacts
 scripts/out/full_signal_sain_local/     Local NiaARM artifacts
-scripts/out/full_signal_sain_local_quantminer/  Local official QuantMiner artifacts
+scripts/out/full_signal_sain_local_quantminer_bitset/  Local official QuantMiner artifacts with default bitset evaluation
 scripts/out/full_signal_sicams/         Detection, change points and compressed stage diagnostics
 scripts/out/full_signal_hybrid/         Models, validation and evaluation predictions
 scripts/out/full_signal_conv/           Models, finite reconstruction scores and observation-aware metrics
