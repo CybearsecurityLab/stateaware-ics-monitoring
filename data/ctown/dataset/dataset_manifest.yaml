@@ -1,0 +1,83 @@
+attack_windows:
+- end: 19/01/17 06
+  id: A8
+  start: 16/01/17 09
+- end: 02/02/17 00
+  id: A9
+  start: 30/01/17 08
+- end: 10/02/17 09
+  id: A10
+  start: 09/02/17 03
+- end: 13/02/17 07
+  id: A11
+  start: 12/02/17 01
+- end: 28/02/17 08
+  id: A12
+  start: 24/02/17 05
+- end: 13/03/17 21
+  id: A13
+  start: 10/03/17 14
+- end: 27/03/17 16
+  id: A14
+  start: 25/03/17 20
+column_map:
+  ATT_FLAG: att_flag
+  DATETIME: datetime
+  F_PU1: f_pu1
+  F_PU10: f_pu10
+  F_PU11: f_pu11
+  F_PU2: f_pu2
+  F_PU3: f_pu3
+  F_PU4: f_pu4
+  F_PU5: f_pu5
+  F_PU6: f_pu6
+  F_PU7: f_pu7
+  F_PU8: f_pu8
+  F_PU9: f_pu9
+  F_V2: f_v2
+  L_T1: l_t1
+  L_T2: l_t2
+  L_T3: l_t3
+  L_T4: l_t4
+  L_T5: l_t5
+  L_T6: l_t6
+  L_T7: l_t7
+  P_J14: p_j14
+  P_J256: p_j256
+  P_J269: p_j269
+  P_J280: p_j280
+  P_J289: p_j289
+  P_J300: p_j300
+  P_J302: p_j302
+  P_J306: p_j306
+  P_J307: p_j307
+  P_J317: p_j317
+  P_J415: p_j415
+  P_J422: p_j422
+  S_PU1: s_pu1
+  S_PU10: s_pu10
+  S_PU11: s_pu11
+  S_PU2: s_pu2
+  S_PU3: s_pu3
+  S_PU4: s_pu4
+  S_PU5: s_pu5
+  S_PU6: s_pu6
+  S_PU7: s_pu7
+  S_PU8: s_pu8
+  S_PU9: s_pu9
+  S_V2: s_v2
+files:
+  calibration:
+  - calibration/calibration.csv
+  evaluation:
+  - evaluation/test.csv
+generated_at: '2026-05-19T02:38:33.982841+00:00'
+schema: dataio/v1
+sha256:
+  calibration/calibration.csv: 50cdec513bc5f3f4756cf47675c452062ff0b55f776a3df66c2cd24d4b38984b
+  evaluation/test.csv: d2e311eb4a78d3f2150610ca257bc39d6f9ddc090d0fdb9fc5f6fde70b07c7e3
+source:
+  format: csv
+  name: BATADAL_dataset03_train_1.csv + BATADAL_test_dataset.csv
+  note: BATADAL is the C-Town network; renamed to ctown for repo consistency
+topology: ctown

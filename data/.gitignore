@@ -1,0 +1,8 @@
+wadi/raw/
+ltown/raw/
+
+# Large generated artifacts -- regenerable, kept out of version control
+generated/*/gfsm/*.gfsm.json
+generated/*/gfsm/*.gfsm.dot
+generated/*/invariants/*_phi.json
+*.DS_Store*
